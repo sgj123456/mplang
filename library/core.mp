@@ -1,9 +1,58 @@
 // core —— 对应 Rust 的 `core` crate：与平台 / 堆无关的基础能力。
 //
-// 这里提供数值工具、泛型算法、内存与字符串的 libc 薄封装，以及打印辅助。
+// 这里提供数值工具、泛型算法、运算符 trait、内存与字符串的 libc 薄封装，
+// 以及打印辅助。
 // 本 crate 不依赖堆，可独立被 `extern crate core;` 引入使用。
 //
-// 注意：MPLang 现在支持 enum 与 match，故提供 Rust 式的 `Option` / `Result` 类型。
+// 注意：运算符 trait（Add/Sub/Mul/Div/Neg/Eq/Ord）为内置类型实现后，
+// 编译器在遇到 `a + b` 时对 int/*char 等内置类型直接生成机器指令，
+// 不会递归调用 trait 方法。用户类型可通过 impl Add 等实现运算符重载。
+
+// ───────────────── 运算符 trait ─────────────────
+
+trait Add<Rhs> { fn add(rhs: Rhs) -> int; }
+trait Sub<Rhs> { fn sub(rhs: Rhs) -> int; }
+trait Mul<Rhs> { fn mul(rhs: Rhs) -> int; }
+trait Div<Rhs> { fn div(rhs: Rhs) -> int; }
+trait Neg { fn neg() -> int; }
+trait Eq<Rhs> { fn eq(rhs: Rhs) -> int; fn ne(rhs: Rhs) -> int; }
+trait Ord<Rhs> { fn lt(rhs: Rhs) -> int; fn le(rhs: Rhs) -> int; fn gt(rhs: Rhs) -> int; fn ge(rhs: Rhs) -> int; }
+
+// 为内置类型实现运算符 trait。注意：这些 impl 方法体仅供文档参考，
+// 编译器对内置类型的 `a + b` 会直接生成机器指令，不走 trait 调用，
+// 因此方法体内的递归调用不会实际执行。
+
+impl Add<int> for int {
+    fn add(rhs: int) -> int { return self + rhs; }
+}
+
+impl Sub<int> for int {
+    fn sub(rhs: int) -> int { return self - rhs; }
+}
+
+impl Mul<int> for int {
+    fn mul(rhs: int) -> int { return self * rhs; }
+}
+
+impl Div<int> for int {
+    fn div(rhs: int) -> int { return self / rhs; }
+}
+
+impl Neg for int {
+    fn neg() -> int { return 0 - self; }
+}
+
+impl Eq<int> for int {
+    fn eq(rhs: int) -> int { return self == rhs; }
+    fn ne(rhs: int) -> int { return 0 - self.eq(rhs); }
+}
+
+impl Ord<int> for int {
+    fn lt(rhs: int) -> int { return self < rhs; }
+    fn le(rhs: int) -> int { return self <= rhs; }
+    fn gt(rhs: int) -> int { return self > rhs; }
+    fn ge(rhs: int) -> int { return self >= rhs; }
+}
 
 // ───────────────── Option / Result 枚举 ─────────────────
 

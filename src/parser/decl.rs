@@ -260,18 +260,19 @@ impl Parser {
         // `impl Trait for T` 或普通 `impl T`：先解析首个类型，
         // 若其后紧跟 `for` 则是 trait 实现形式。
         let first = self.parse_type();
-        let (trait_ref, ty) = if self.check(&TokenKind::For) {
+        let (trait_ref, trait_args, ty) = if self.check(&TokenKind::For) {
             self.advance();
-            let path = match &first {
-                Type::Named(p) => p.clone(),
+            let (path, args) = match &first {
+                Type::Named(p) => (p.clone(), Vec::new()),
+                Type::Applied(p, a) => (p.clone(), a.clone()),
                 _ => crate::error::fatal(MplangError::parse(
                     "impl <trait> for <type> 中的 trait 名必须是路径",
                 )),
             };
             let ty = self.parse_type();
-            (Some(path), ty)
+            (Some(path), args, ty)
         } else {
-            (None, first)
+            (None, Vec::new(), first)
         };
         self.consume(TokenKind::LeftBrace, "Expected '{' after impl type");
         let mut methods = Vec::new();
@@ -295,6 +296,7 @@ impl Parser {
             attributes,
             generics,
             trrait: trait_ref,
+            trait_args,
             ty,
             methods,
         }

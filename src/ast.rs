@@ -227,7 +227,11 @@ pub enum TopLevelDecl {
         attributes: Vec<Meta>,
         generics: Vec<GenericParam>,
         /// `impl Trait for T` 时为 `Some(trait 名)`；普通 `impl T` 为 `None`。
+        /// 对于 `impl Add<int> for MyType`，trrait 为 `Some(Path(["Add"]))`，
+        /// trait_args 为 `[Type(int)]`。
         trrait: Option<Path>,
+        /// trait 的类型实参（如 `Add<int>` 中的 `[int]`）。
+        trait_args: Vec<TypeOrConst>,
         ty: Type,
         methods: Vec<ImplMethod>,
     },

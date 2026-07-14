@@ -30,6 +30,13 @@ use crate::error::{MplangError, fatal, into_result};
 use crate::hir::{self, ArrayLen, DefId, HirType, ParamKind, TypeOrConst, Visibility};
 use crate::symbol::SymbolPath;
 
+/// trait 的完整信息（泛型参数与方法契约）。
+#[derive(Clone)]
+struct TraitInfo {
+    generics: Vec<ast::GenericParam>,
+    methods: Vec<TraitMethodInfo>,
+}
+
 pub struct Lowerer {
     next_id: u32,
 
@@ -55,9 +62,9 @@ pub struct Lowerer {
     /// 已加载模块的源码缓存（避免重复解析）。
     loaded_cache: HashMap<String, CompilationUnit>,
 
-    /// `trait` 名 → 其方法契约。键用 trait 的「裸名」（最后一段）。
+    /// `trait` 名 → 其方法契约与泛型参数。键用 trait 的「裸名」（最后一段）。
     /// 每个方法保留原始 AST 参数与（可选的）默认实现体，供「默认方法合成」使用。
-    traits: HashMap<String, Vec<TraitMethodInfo>>,
+    traits: HashMap<String, TraitInfo>,
 
     /// 变体构造器 DefId → (枚举 DefId, 变体名)。
     /// 由 register_decls 在 Enum 分支填充，供 lower_expr 在 Call→Variant 改写时查询。
@@ -81,6 +88,8 @@ pub struct Lowerer {
 #[derive(Clone)]
 struct TraitMethodInfo {
     name: String,
+    /// 方法自身的泛型参数。
+    method_generics: Vec<ast::GenericParam>,
     params: Vec<ast::Param>,
     return_ty: ast::Type,
     /// `None` = 必须由实现方提供；`Some(body)` = 默认实现（可被重写）。
@@ -198,7 +207,12 @@ impl Lowerer {
                 | TopLevelDecl::Const { name, .. } => {
                     self.register_def(prefix, name);
                 }
-                TopLevelDecl::Trait { name, methods, .. } => {
+                TopLevelDecl::Trait {
+                    name,
+                    methods,
+                    generics,
+                    ..
+                } => {
                     // trait 仅作编译期契约：登记其方法签名表（按裸名索引），
                     // 并为 trait 自身分配一个 DefId（供 `impl Trait for` 名字解析）。
                     self.register_def(prefix, name);
@@ -210,13 +224,20 @@ impl Lowerer {
                         .iter()
                         .map(|m| TraitMethodInfo {
                             name: m.name.clone(),
+                            method_generics: m.generics.clone(),
                             params: m.params.clone(),
                             return_ty: m.return_ty.clone(),
                             default_body: m.default_body.clone(),
                             is_static: m.is_static,
                         })
                         .collect();
-                    self.traits.insert(name.clone(), infos);
+                    self.traits.insert(
+                        name.clone(),
+                        TraitInfo {
+                            generics: generics.clone(),
+                            methods: infos,
+                        },
+                    );
                 }
                 TopLevelDecl::Impl { .. } => {
                     // 方法的 DefId 在降低趟 B 中按需分配（含 trait 默认方法的合成）。
@@ -337,6 +358,7 @@ impl Lowerer {
                 }
                 TopLevelDecl::Impl {
                     trrait,
+                    trait_args,
                     ty,
                     methods,
                     generics,
@@ -353,15 +375,29 @@ impl Lowerer {
                     let mut trait_def_for_vtable = None;
                     if let Some(tr) = trrait {
                         let tr_name = tr.last().unwrap_or("?").to_string();
-                        let req = self.traits.get(&tr_name).cloned().unwrap_or_else(|| {
+                        let trait_info = self.traits.get(&tr_name).cloned().unwrap_or_else(|| {
                             fatal(MplangError::lowering(format!("未找到 trait `{}`", tr_name)))
                         });
+                        let req = trait_info.methods;
                         // 查找 trait 的 DefId
                         if let Some(trait_def) = self.trait_def_map.get(&tr_name) {
                             trait_def_for_vtable = Some(*trait_def);
                         }
                         let provided: std::collections::HashSet<String> =
                             methods.iter().map(|m| m.name.clone()).collect();
+
+                        // 设置泛型上下文：trait 的泛型 + 方法自身的泛型，供签名比较时 lower_type 解析。
+                        let saved2 =
+                            std::mem::replace(&mut self.cur_generics, trait_info.generics.clone());
+
+                        // 把 trait_args 中的 AST 类型实参降低为 HIR 类型，用于代入 trait 泛型。
+                        let trait_hir_args: Vec<HirType> = trait_args
+                            .iter()
+                            .filter_map(|a| match a {
+                                crate::ast::TypeOrConst::Type(t) => Some(self.lower_type(t)),
+                                _ => None,
+                            })
+                            .collect();
 
                         for m in methods {
                             // 实现的方法必须属于该 trait。
@@ -394,7 +430,14 @@ impl Lowerer {
                                 )));
                             }
                             for (i, p) in m.params.iter().enumerate() {
-                                let expect = self.lower_type(&sig.params[i].ty);
+                                let expect_raw = self.lower_type(&sig.params[i].ty);
+                                // 用 trait 的类型实参代入泛型占位符（如 Rhs → int）。
+                                let expect = crate::tycheck::TypeChecker::subst_type(
+                                    &expect_raw,
+                                    &trait_info.generics,
+                                    &trait_hir_args,
+                                    &[],
+                                );
                                 let got = self.lower_type(&p.ty);
                                 if got != expect {
                                     fatal(MplangError::lowering(format!(
@@ -403,7 +446,13 @@ impl Lowerer {
                                     )));
                                 }
                             }
-                            let expect_ret = self.lower_type(&sig.return_ty);
+                            let expect_ret_raw = self.lower_type(&sig.return_ty);
+                            let expect_ret = crate::tycheck::TypeChecker::subst_type(
+                                &expect_ret_raw,
+                                &trait_info.generics,
+                                &trait_hir_args,
+                                &[],
+                            );
                             let got_ret = self.lower_type(&m.return_ty);
                             if got_ret != expect_ret {
                                 fatal(MplangError::lowering(format!(
@@ -433,6 +482,8 @@ impl Lowerer {
                                 });
                             }
                         }
+                        // 恢复泛型上下文（trait 的泛型仅用于签名比较）。
+                        self.cur_generics = saved2;
                     }
 
                     // 收集方法 DefId（按 to_lower 的插入顺序，即 trait 方法声明顺序）。
@@ -456,8 +507,9 @@ impl Lowerer {
                         && let Some(impl_type_def) = impl_type_def
                     {
                         let tr_name = trrait.as_ref().unwrap().last().unwrap().to_string();
-                        let req = self.traits.get(&tr_name).unwrap();
-                        let vtable_methods: Vec<DefId> = req
+                        let trait_info = self.traits.get(&tr_name).unwrap();
+                        let vtable_methods: Vec<DefId> = trait_info
+                            .methods
                             .iter()
                             .map(|tm| {
                                 lowered_ids.get(&tm.name).cloned().unwrap_or_else(|| {
@@ -1057,6 +1109,12 @@ impl Lowerer {
                 {
                     return HirType::Var(idx);
                 }
+                eprintln!(
+                    "DBG lower_type Named FAIL: path={:?}, cur_generics={:?}, last_seg_index keys sample={:?}",
+                    path,
+                    self.cur_generics,
+                    self.last_seg_index.keys().take(5).collect::<Vec<_>>()
+                );
                 let def = self.resolve_path(path, "类型");
                 if self.enum_defs.contains(&def) {
                     HirType::Enum(def, Vec::new(), Vec::new())

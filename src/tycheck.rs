@@ -568,35 +568,56 @@ impl TypeChecker {
             hir::HirExpr::Binary { op, lhs, rhs } => {
                 let l = self.check_expr(lhs);
                 let r = self.check_expr(rhs);
-                match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
-                        self.assert_ty(&l.ty, &HirType::Int, "算术运算左操作数");
-                        self.assert_ty(&r.ty, &HirType::Int, "算术运算右操作数");
-                    }
+
+                // 判断是否为「内置类型」的直接运算（int 算术、int/* 比较）。
+                let is_builtin_arith =
+                    matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+                        && l.ty == HirType::Int
+                        && r.ty == HirType::Int;
+                let is_builtin_cmp = matches!(
+                    op,
                     BinOp::Less
-                    | BinOp::LessEqual
-                    | BinOp::Equal
-                    | BinOp::NotEqual
-                    | BinOp::Greater
-                    | BinOp::GreaterEqual => {
-                        // 整数或同是指针均可比较（指针比较按地址）。
-                        let int_cmp = matches!(l.ty, HirType::Int) && matches!(r.ty, HirType::Int);
-                        let ptr_cmp = matches!(l.ty, HirType::Pointer(_))
-                            && matches!(r.ty, HirType::Pointer(_));
-                        if !(int_cmp || ptr_cmp) {
-                            fatal(MplangError::type_error(
-                                "比较运算的两个操作数必须同为 int 或同为指针",
-                            ));
-                        }
+                        | BinOp::LessEqual
+                        | BinOp::Equal
+                        | BinOp::NotEqual
+                        | BinOp::Greater
+                        | BinOp::GreaterEqual
+                ) && ((l.ty == HirType::Int && r.ty == HirType::Int)
+                    || (matches!(l.ty, HirType::Pointer(_))
+                        && matches!(r.ty, HirType::Pointer(_))));
+
+                if is_builtin_arith || is_builtin_cmp {
+                    // 内置类型：直接编译（不走 trait 方法，避免递归）。
+                    crate::tyhir::TyHirExpr {
+                        ty: HirType::Int,
+                        kind: crate::tyhir::TyHirExprKind::Binary {
+                            op: *op,
+                            lhs: Box::new(l),
+                            rhs: Box::new(r),
+                        },
                     }
-                }
-                crate::tyhir::TyHirExpr {
-                    ty: HirType::Int,
-                    kind: crate::tyhir::TyHirExprKind::Binary {
-                        op: *op,
-                        lhs: Box::new(l),
-                        rhs: Box::new(r),
-                    },
+                } else {
+                    // 非内置类型：通过 trait 方法实现运算符重载。
+                    // 将 `a + b` 改写为 `a.add(b)` 等方法调用。
+                    let method_name = match op {
+                        BinOp::Add => "add",
+                        BinOp::Sub => "sub",
+                        BinOp::Mul => "mul",
+                        BinOp::Div => "div",
+                        BinOp::Equal => "eq",
+                        BinOp::NotEqual => "ne",
+                        BinOp::Less => "lt",
+                        BinOp::LessEqual => "le",
+                        BinOp::Greater => "gt",
+                        BinOp::GreaterEqual => "ge",
+                    };
+                    // 构造 MethodCall 并递归检查。
+                    let method_call = hir::HirExpr::MethodCall {
+                        object: lhs.clone(),
+                        name: method_name.to_string(),
+                        args: vec![*rhs.clone()],
+                    };
+                    self.check_expr(&method_call)
                 }
             }
 
