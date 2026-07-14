@@ -59,6 +59,20 @@ pub struct Lowerer {
     /// 每个方法保留原始 AST 参数与（可选的）默认实现体，供「默认方法合成」使用。
     traits: HashMap<String, Vec<TraitMethodInfo>>,
 
+    /// 变体构造器 DefId → (枚举 DefId, 变体名)。
+    /// 由 register_decls 在 Enum 分支填充，供 lower_expr 在 Call→Variant 改写时查询。
+    variant_defs: HashMap<DefId, (DefId, String)>,
+
+    /// 所有已注册的枚举 DefId 集合。用于在 lower_type 中区分 struct 和 enum 类型。
+    enum_defs: HashSet<DefId>,
+
+    /// trait 裸名 → trait 的 DefId。用于 lower_type 中识别 `*Trait` 语法。
+    trait_def_map: HashMap<String, DefId>,
+
+    /// (trait_def, impl_type_def) → 按 trait 方法声明顺序排列的具体方法 DefId 列表。
+    /// 在 lower_decls 的 Impl 分支填充，最终写入 HirCompilationUnit。
+    vtables: HashMap<(DefId, DefId), Vec<DefId>>,
+
     /// 输入文件所在目录，用于查找 `mod x;` 对应的 `x.mp`。
     base_dir: Option<PathBuf>,
 }
@@ -84,6 +98,10 @@ impl Lowerer {
             loaded_set: HashSet::new(),
             loaded_cache: HashMap::new(),
             traits: HashMap::new(),
+            variant_defs: HashMap::new(),
+            enum_defs: HashSet::new(),
+            trait_def_map: HashMap::new(),
+            vtables: HashMap::new(),
             cur_generics: Vec::new(),
             base_dir,
         }
@@ -135,6 +153,7 @@ impl Lowerer {
                 attributes: Vec::new(),
                 items,
             },
+            vtables: std::mem::take(&mut self.vtables),
         }
     }
 
@@ -182,6 +201,10 @@ impl Lowerer {
                     // trait 仅作编译期契约：登记其方法签名表（按裸名索引），
                     // 并为 trait 自身分配一个 DefId（供 `impl Trait for` 名字解析）。
                     self.register_def(prefix, name);
+                    let mut segs = prefix.to_vec();
+                    segs.push(name.clone());
+                    let trait_def = self.path_to_def[&self.sym(&segs)];
+                    self.trait_def_map.insert(name.clone(), trait_def);
                     let infos = methods
                         .iter()
                         .map(|m| TraitMethodInfo {
@@ -195,6 +218,21 @@ impl Lowerer {
                 }
                 TopLevelDecl::Impl { .. } => {
                     // 方法的 DefId 在降低趟 B 中按需分配（含 trait 默认方法的合成）。
+                }
+                TopLevelDecl::Enum { name, variants, .. } => {
+                    // 为枚举及其每个变体注册 DefId（变体构造器名与函数名/结构体名处于同一命名空间）。
+                    self.register_def(prefix, name);
+                    let mut enum_segs = prefix.to_vec();
+                    enum_segs.push(name.clone());
+                    let enum_def = self.path_to_def[&self.sym(&enum_segs)];
+                    self.enum_defs.insert(enum_def);
+                    for v in variants {
+                        self.register_def(prefix, &v.name);
+                        let mut v_segs = prefix.to_vec();
+                        v_segs.push(v.name.clone());
+                        let v_def = self.path_to_def[&self.sym(&v_segs)];
+                        self.variant_defs.insert(v_def, (enum_def, v.name.clone()));
+                    }
                 }
             }
         }
@@ -310,11 +348,16 @@ impl Lowerer {
                     // 若为 trait 实现：校验必填方法都已提供、签名匹配，并收集
                     // 未重写但带默认实现的方法（合成后一并降低）。
                     let mut to_lower = methods.clone();
+                    let mut trait_def_for_vtable = None;
                     if let Some(tr) = trrait {
                         let tr_name = tr.last().unwrap_or("?").to_string();
                         let req = self.traits.get(&tr_name).cloned().unwrap_or_else(|| {
                             fatal(MplangError::lowering(format!("未找到 trait `{}`", tr_name)))
                         });
+                        // 查找 trait 的 DefId
+                        if let Some(trait_def) = self.trait_def_map.get(&tr_name) {
+                            trait_def_for_vtable = Some(*trait_def);
+                        }
                         let provided: std::collections::HashSet<String> =
                             methods.iter().map(|m| m.name.clone()).collect();
 
@@ -380,17 +423,51 @@ impl Lowerer {
                         }
                     }
 
-                    for m in &to_lower {
-                        let id = self.alloc();
+                    // 收集方法 DefId（按 to_lower 的插入顺序，即 trait 方法声明顺序）。
+                    let method_defs: Vec<(String, DefId)> = to_lower
+                        .iter()
+                        .map(|m| {
+                            // 每个方法在循环开始处 self.alloc() 得到其 id
+                            let id = self.alloc();
+                            (m.name.clone(), id)
+                        })
+                        .collect();
 
-                        // 方法自身泛型 =（外层 impl 的泛型）++（方法声明的泛型）。
-                        // 这样方法体内既能引用 impl 的类型参数，也能引用方法自身的类型参数，
-                        // 二者在 Var 下标空间里连续编号。
+                    let lowered_ids: HashMap<String, DefId> = method_defs.iter().cloned().collect();
+
+                    // 收集 vtable 条目：按 trait 方法声明顺序排列
+                    let impl_type_def = match &recv_ty {
+                        HirType::Named(d) => Some(*d),
+                        _ => None,
+                    };
+                    if let Some(trait_def) = trait_def_for_vtable {
+                        if let Some(impl_type_def) = impl_type_def {
+                            let tr_name = trrait.as_ref().unwrap().last().unwrap().to_string();
+                            let req = self.traits.get(&tr_name).unwrap();
+                            let vtable_methods: Vec<DefId> = req
+                                .iter()
+                                .map(|tm| {
+                                    lowered_ids.get(&tm.name).cloned().unwrap_or_else(|| {
+                                        fatal(MplangError::lowering(format!(
+                                            "内部错误：方法 `{}` 未在 vtable 中找到",
+                                            tm.name
+                                        )))
+                                    })
+                                })
+                                .collect();
+                            self.vtables
+                                .insert((trait_def, impl_type_def), vtable_methods);
+                        }
+                    }
+
+                    // 现在用 method_defs 中的预分配 ID 来真正降低每个方法。
+                    for (m, (mname, mid)) in to_lower.iter().zip(method_defs.iter()) {
+                        // mname 应与 m.name 一致，mid 是预分配的 DefId
+                        let _ = mname;
                         let combined: Vec<GenericParam> =
                             generics.iter().chain(m.generics.iter()).cloned().collect();
                         let saved = std::mem::replace(&mut self.cur_generics, combined.clone());
 
-                        // 隐式接收者 `self`：作为方法的首个参数，类型即 impl 的类型。
                         let self_id = self.alloc();
                         let mut locals: HashMap<String, DefId> = HashMap::new();
                         locals.insert("self".to_string(), self_id);
@@ -401,7 +478,6 @@ impl Lowerer {
                             ty: recv_ty.clone(),
                             kind: ParamKind::Value,
                         }];
-                        // 常量参数以 `Int` 类型的局部 DefId 形式登记（供 `N` 引用）。
                         for (i, gp) in combined.iter().enumerate() {
                             if gp.kind == crate::ast::GenericParamKind::Const {
                                 let cid = self.alloc();
@@ -429,7 +505,7 @@ impl Lowerer {
                         self.cur_generics = saved;
 
                         items.push(hir::HirItem::Fn {
-                            def_id: id,
+                            def_id: *mid,
                             visibility: Visibility::Public,
                             attributes: Vec::new(),
                             name: m.name.clone(),
@@ -469,6 +545,51 @@ impl Lowerer {
                         name: name.clone(),
                         generics: generics.clone(),
                         fields: fields_hir,
+                    });
+                }
+                TopLevelDecl::Enum {
+                    attributes,
+                    name,
+                    generics,
+                    variants,
+                } => {
+                    let mut segs = prefix.to_vec();
+                    segs.push(name.clone());
+                    let id = self.path_to_def[&self.sym(&segs)];
+                    let saved = std::mem::replace(&mut self.cur_generics, generics.clone());
+                    let hir_variants: Vec<hir::HirEnumVariant> = variants
+                        .iter()
+                        .enumerate()
+                        .map(|(tag, v)| {
+                            let mut v_segs = prefix.to_vec();
+                            v_segs.push(v.name.clone());
+                            let v_def = self.path_to_def[&self.sym(&v_segs)];
+                            let fields_hir = v
+                                .fields
+                                .iter()
+                                .map(|(fname, fty)| hir::HirField {
+                                    def_id: self.alloc(),
+                                    name: fname.clone(),
+                                    ty: self.lower_type(fty),
+                                    visibility: Visibility::Public,
+                                })
+                                .collect();
+                            hir::HirEnumVariant {
+                                def_id: v_def,
+                                name: v.name.clone(),
+                                tag: tag as u32,
+                                fields: fields_hir,
+                            }
+                        })
+                        .collect();
+                    self.cur_generics = saved;
+                    items.push(hir::HirItem::Enum {
+                        def_id: id,
+                        visibility: Visibility::Public,
+                        attributes: attributes.clone(),
+                        name: name.clone(),
+                        generics: generics.clone(),
+                        variants: hir_variants,
                     });
                 }
                 TopLevelDecl::Static {
@@ -656,7 +777,17 @@ impl Lowerer {
                     return hir::HirExpr::Path(*id);
                 }
                 let def = self.resolve_path(path, "标识符");
-                hir::HirExpr::Path(def)
+                // 若标识符是变体构造器（如 `None`），改写为 Variant（无参）。
+                if let Some((enum_def, variant)) = self.variant_defs.get(&def).cloned() {
+                    hir::HirExpr::Variant {
+                        def_id: enum_def,
+                        variant,
+                        args: Vec::new(),
+                        turbofish: Vec::new(),
+                    }
+                } else {
+                    hir::HirExpr::Path(def)
+                }
             }
             Expr::Paren(inner) => self.lower_expr(inner, locals),
             Expr::Binary { op, lhs, rhs } => hir::HirExpr::Binary {
@@ -671,10 +802,20 @@ impl Lowerer {
             } => {
                 let def = self.resolve_path(callee, "函数调用");
                 let args_hir = args.iter().map(|a| self.lower_expr(a, locals)).collect();
-                hir::HirExpr::Call {
-                    callee: def,
-                    args: args_hir,
-                    turbofish: self.lower_turbofish(turbofish),
+                // 若 callee 是已注册的变体构造器，改写为 Variant 表达式。
+                if let Some((enum_def, variant)) = self.variant_defs.get(&def).cloned() {
+                    hir::HirExpr::Variant {
+                        def_id: enum_def,
+                        variant,
+                        args: args_hir,
+                        turbofish: self.lower_turbofish(turbofish),
+                    }
+                } else {
+                    hir::HirExpr::Call {
+                        callee: def,
+                        args: args_hir,
+                        turbofish: self.lower_turbofish(turbofish),
+                    }
                 }
             }
             Expr::FieldAccess { object, field } => hir::HirExpr::FieldAccess {
@@ -739,6 +880,83 @@ impl Lowerer {
                 array: Box::new(self.lower_expr(array, locals)),
                 index: Box::new(self.lower_expr(index, locals)),
             },
+
+            Expr::Match { scrutinee, arms } => {
+                let scrutinee_hir = self.lower_expr(scrutinee, locals);
+                let mut arms_hir = Vec::with_capacity(arms.len());
+                for arm in arms {
+                    let saved = locals.clone();
+                    let pattern_hir = self.lower_pattern(&arm.pattern, locals);
+                    let body_hir = self.lower_body(&arm.body, locals);
+                    arms_hir.push(hir::HirMatchArm {
+                        pattern: pattern_hir,
+                        body: body_hir,
+                    });
+                    // 恢复 locals，避免模式绑定泄漏到 match 表达式之后的作用域
+                    *locals = saved;
+                }
+                hir::HirExpr::Match {
+                    scrutinee: Box::new(scrutinee_hir),
+                    arms: arms_hir,
+                }
+            }
+        }
+    }
+
+    fn lower_pattern(
+        &mut self,
+        pattern: &ast::Pattern,
+        locals: &mut HashMap<String, DefId>,
+    ) -> hir::HirPattern {
+        match pattern {
+            ast::Pattern::Variant {
+                enum_def,
+                variant,
+                bindings,
+            } => {
+                // 先解析变体构造器名（`Some`）得到其 DefId，再反查枚举 DefId
+                let variant_def = self.resolve_path(enum_def, "变体模式");
+                let (enum_def_id, _) =
+                    self.variant_defs
+                        .get(&variant_def)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            fatal(MplangError::lowering(format!(
+                                "`{}` 不是枚举变体",
+                                enum_def
+                            )))
+                        });
+                let mut hir_bindings = Vec::with_capacity(bindings.len());
+                for (bname, bty) in bindings {
+                    let id = self.alloc();
+                    locals.insert(bname.clone(), id);
+                    let hir_ty = bty.as_ref().map(|t| self.lower_type(t));
+                    hir_bindings.push((id, hir_ty));
+                }
+                hir::HirPattern::Variant {
+                    enum_def: enum_def_id,
+                    variant: variant.clone(),
+                    bindings: hir_bindings,
+                }
+            }
+            ast::Pattern::Literal(l) => hir::HirPattern::Literal(l.clone()),
+            ast::Pattern::Wildcard => hir::HirPattern::Wildcard,
+            ast::Pattern::Ident(name) => {
+                // 检查该名字是否对应一个单元变体（如 `None`）
+                if let Some(&v_def) = self.last_seg_index.get(name)
+                    && let Some((enum_def, variant_name)) = self.variant_defs.get(&v_def).cloned()
+                {
+                    // 是变体构造器 → 单元变体模式
+                    return hir::HirPattern::Variant {
+                        enum_def,
+                        variant: variant_name,
+                        bindings: Vec::new(),
+                    };
+                }
+                let id = self.alloc();
+                locals.insert(name.clone(), id);
+                hir::HirPattern::Ident(id)
+            }
         }
     }
 
@@ -746,7 +964,16 @@ impl Lowerer {
         match ty {
             Type::Int => HirType::Int,
             Type::Char => HirType::Char,
-            Type::Pointer(inner) => HirType::Pointer(Box::new(self.lower_type(inner))),
+            Type::Pointer(inner) => {
+                let inner_hir = self.lower_type(inner);
+                // 若 inner 是 `Named(def)` 且 def 是已注册的 trait，则返回 TraitObject
+                if let HirType::Named(def) = &inner_hir {
+                    if self.trait_def_map.values().any(|t| t == def) {
+                        return HirType::TraitObject(*def);
+                    }
+                }
+                HirType::Pointer(Box::new(inner_hir))
+            }
             Type::Unit => HirType::Unit,
             Type::Array(inner, len) => {
                 let e = self.lower_type(inner);
@@ -766,7 +993,11 @@ impl Lowerer {
                     return HirType::Var(idx);
                 }
                 let def = self.resolve_path(path, "类型");
-                HirType::Named(def)
+                if self.enum_defs.contains(&def) {
+                    HirType::Enum(def, Vec::new(), Vec::new())
+                } else {
+                    HirType::Named(def)
+                }
             }
             Type::Applied(path, args) => {
                 let def = self.resolve_path(path, "类型");
@@ -794,7 +1025,37 @@ impl Lowerer {
                         }
                     }
                 }
-                HirType::Generic(def, targs, cargs)
+                if self.enum_defs.contains(&def) {
+                    HirType::Enum(def, targs, cargs)
+                } else {
+                    HirType::Generic(def, targs, cargs)
+                }
+            }
+            Type::Enum(path, args) => {
+                let def = self.resolve_path(path, "枚举类型");
+                let mut targs = Vec::new();
+                let mut cargs = Vec::new();
+                for a in args {
+                    match a {
+                        crate::ast::TypeOrConst::Type(t) => {
+                            if let crate::ast::Type::Named(p) = t
+                                && p.segments.len() == 1
+                                && let Some(idx) = self.cur_generics.iter().position(|g| {
+                                    g.kind == crate::ast::GenericParamKind::Const
+                                        && g.name == p.segments[0]
+                                })
+                            {
+                                cargs.push(crate::hir::ConstArg::Param(idx));
+                            } else {
+                                targs.push(self.lower_type(t));
+                            }
+                        }
+                        crate::ast::TypeOrConst::Const(v) => {
+                            cargs.push(crate::hir::ConstArg::Literal(*v))
+                        }
+                    }
+                }
+                HirType::Enum(def, targs, cargs)
             }
         }
     }

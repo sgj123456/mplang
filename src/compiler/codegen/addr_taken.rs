@@ -72,6 +72,26 @@ fn collect_addr_taken_expr(e: &tyhir::TyHirExpr, set: &mut HashSet<DefId>) {
             }
         }
         tyhir::TyHirExprKind::Path(_) | tyhir::TyHirExprKind::Literal(_) => {}
+        tyhir::TyHirExprKind::Variant { args, .. } => {
+            for a in args {
+                collect_addr_taken_expr(a, set);
+            }
+        }
+        tyhir::TyHirExprKind::Match { scrutinee, arms } => {
+            collect_addr_taken_expr(scrutinee, set);
+            for arm in arms {
+                collect_addr_taken(&arm.body.stmts, set);
+            }
+        }
+        tyhir::TyHirExprKind::TraitCast { value, .. } => {
+            collect_addr_taken_expr(value, set);
+        }
+        tyhir::TyHirExprKind::DynamicMethodCall { receiver, args, .. } => {
+            collect_addr_taken_expr(receiver, set);
+            for a in args {
+                collect_addr_taken_expr(a, set);
+            }
+        }
     }
 }
 

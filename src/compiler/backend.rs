@@ -22,6 +22,8 @@ impl<T: Module> Compiler<T> {
             func_map: HashMap::new(),
             data_map: HashMap::new(),
             struct_map: HashMap::new(),
+            enum_map: HashMap::new(),
+            vtable_map: HashMap::new(),
         }
     }
 }

@@ -155,6 +155,9 @@ impl Lexer {
                 if !self.is_at_end() && self.current_char() == '=' {
                     self.advance();
                     self.make_token(TokenKind::Equal, "==".into(), start_line, start_col)
+                } else if !self.is_at_end() && self.current_char() == '>' {
+                    self.advance();
+                    self.make_token(TokenKind::FatArrow, "=>".into(), start_line, start_col)
                 } else {
                     self.make_token(TokenKind::Assign, "=".into(), start_line, start_col)
                 }
@@ -233,6 +236,8 @@ impl Lexer {
                     "crate" => TokenKind::Crate,
                     "impl" => TokenKind::Impl,
                     "trait" => TokenKind::Trait,
+                    "enum" => TokenKind::Enum,
+                    "match" => TokenKind::Match,
                     _ => TokenKind::Ident,
                 };
                 self.make_token(token_type, lexeme, start_line, start_col)

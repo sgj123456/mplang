@@ -8,7 +8,10 @@ impl<T: Module> Compiler<T> {
     /// 按值复制：对于 struct / array 分配新栈槽并拷贝；标量直接返回。
     pub fn copy_value(&mut self, builder: &mut FunctionBuilder, val: Value, ty: &HirType) -> Value {
         match ty {
-            HirType::Named(_) | HirType::Array(_, _) => {
+            HirType::Named(_)
+            | HirType::Array(_, _)
+            | HirType::Enum(_, _, _)
+            | HirType::TraitObject(_) => {
                 let size = self.var_type_size(ty);
                 if size == 0 {
                     return val;
@@ -73,6 +76,33 @@ impl<T: Module> Compiler<T> {
             // 以下变体只存在于泛型模板中，单态化后不会到达此处。
             HirType::Var(_) | HirType::Generic(_, _, _) => {
                 unreachable!("单态化后不应出现泛型类型占位符")
+            }
+            HirType::Enum(def, _, _) => {
+                // 枚举 = 指针指向 tag+payload 存储；按整体大小逐字节拷贝
+                let size = self.enum_size(def) as i64;
+                for off in (0..size).step_by(8) {
+                    let src_addr = builder.ins().iadd_imm(val, off);
+                    let dst_addr = builder.ins().iadd_imm(dst, off);
+                    let v = builder
+                        .ins()
+                        .load(types::I64, MemFlagsData::new(), src_addr, 0);
+                    builder.ins().store(MemFlagsData::new(), v, dst_addr, 0);
+                }
+            }
+            HirType::TraitObject(_) => {
+                // 16B fat pointer: 2 × ptr (data ptr + vtable ptr)
+                let ptr_bytes = self.ptr_type().bytes() as i64;
+                for off in [0i64, ptr_bytes] {
+                    let src_addr = builder.ins().iadd_imm(val, off);
+                    let dst_addr = builder.ins().iadd_imm(dst, off);
+                    let v = builder
+                        .ins()
+                        .load(self.ptr_type(), MemFlagsData::new(), src_addr, 0);
+                    builder.ins().store(MemFlagsData::new(), v, dst_addr, 0);
+                }
+            }
+            HirType::Variant(_, _) => {
+                unreachable!("Variant 不应到达 copy_value_to")
             }
         }
     }

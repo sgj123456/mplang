@@ -1,6 +1,6 @@
 use crate::error::MplangError;
 use crate::{
-    ast::{ArrayLen, BinOp, Expr, Literal, Path, Type, TypeOrConst},
+    ast::{ArrayLen, BinOp, Expr, Literal, MatchArm, Path, Pattern, Type, TypeOrConst},
     token::TokenKind,
 };
 
@@ -352,6 +352,10 @@ impl Parser {
                 );
                 Expr::Paren(Box::new(expr))
             }
+            TokenKind::Match => {
+                self.advance();
+                return self.match_expr();
+            }
             TokenKind::LeftBracket => {
                 // 数组字面量（列表形式 `[a, b, c]` 或重复形式 `[v; n]`）。
                 self.advance();
@@ -423,9 +427,91 @@ impl Parser {
             repeat: None,
         }
     }
-}
 
-/// 解析字符串转义序列（\n \t \r \\ \" \0 \xNN）。
+    // ───────────────── match 表达式 ─────────────────
+
+    fn match_expr(&mut self) -> Expr {
+        self.consume(TokenKind::LeftParen, "Expected '(' after 'match'");
+        let scrutinee = self.expression();
+        self.consume(TokenKind::RightParen, "Expected ')' after match scrutinee");
+        self.consume(TokenKind::LeftBrace, "Expected '{' for match arms");
+        let mut arms = Vec::new();
+        while !self.is_at_end() && !self.check(&TokenKind::RightBrace) {
+            let pattern = self.parse_pattern();
+            self.consume(TokenKind::FatArrow, "Expected '=>' after pattern");
+            self.consume(TokenKind::LeftBrace, "Expected '{' for match arm body");
+            let body = self.statements();
+            self.consume(TokenKind::RightBrace, "Expected '}' after match arm body");
+            arms.push(MatchArm { pattern, body });
+            if self.check(&TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.consume(TokenKind::RightBrace, "Expected '}' after match arms");
+        Expr::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+        }
+    }
+
+    fn parse_pattern(&mut self) -> Pattern {
+        // 通配模式 `_`
+        if self.check(&TokenKind::Ident) && self.current().lexeme == "_" {
+            self.advance();
+            return Pattern::Wildcard;
+        }
+        // 字面量模式（仅 int / string）
+        if self.check(&TokenKind::IntLiteral) || self.check(&TokenKind::StringLiteral) {
+            let tok = self.advance();
+            let lit = if tok.kind == TokenKind::IntLiteral {
+                Literal::Int(tok.lexeme.parse::<i64>().unwrap())
+            } else {
+                let raw = &tok.lexeme[1..tok.lexeme.len() - 1];
+                Literal::String(raw.to_string())
+            };
+            return Pattern::Literal(lit);
+        }
+        // 变体模式或裸标识符模式
+        let path = self.parse_path();
+        let (variant, bindings) = if self.check(&TokenKind::LeftParen) {
+            self.advance();
+            let mut binds = Vec::new();
+            while !self.is_at_end() && !self.check(&TokenKind::RightParen) {
+                let bname = self
+                    .consume(TokenKind::Ident, "Expected bind name")
+                    .lexeme
+                    .clone();
+                let bty = if self.check(&TokenKind::Colon) {
+                    self.advance();
+                    Some(self.parse_type())
+                } else {
+                    None
+                };
+                binds.push((bname, bty));
+                if self.check(&TokenKind::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            self.consume(TokenKind::RightParen, "Expected ')' after bind names");
+            (path.last().unwrap().to_string(), binds)
+        } else {
+            (String::new(), Vec::new())
+        };
+        // 无括号且单段路径 → 裸标识符模式（绑定整个值）
+        if bindings.is_empty() && path.segments.len() == 1 {
+            return Pattern::Ident(path.segments[0].clone());
+        }
+        Pattern::Variant {
+            enum_def: path,
+            variant,
+            bindings,
+        }
+    }
+}
 pub(crate) fn unescape_string(s: &str) -> Result<String, String> {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars();

@@ -31,6 +31,10 @@ impl<T: Module> Compiler<T> {
             HirType::Var(_) | HirType::Generic(_, _, _) => {
                 unreachable!("单态化后不应出现泛型类型占位符：{:?}", ty)
             }
+            HirType::Enum(_, _, _) | HirType::TraitObject(_) => self.ptr_type(),
+            HirType::Variant(_, _) => {
+                unreachable!("Variant 应在 codegen 前被压平为存储写入")
+            }
         }
     }
 
@@ -47,6 +51,11 @@ impl<T: Module> Compiler<T> {
             HirType::Named(struct_def) => self.struct_size(struct_def),
             HirType::Var(_) | HirType::Generic(_, _, _) => {
                 unreachable!("单态化后不应出现泛型类型占位符")
+            }
+            HirType::Enum(def, _, _) => self.enum_size(def),
+            HirType::TraitObject(_) => 2 * self.ptr_type().bytes(),
+            HirType::Variant(_, _) => {
+                unreachable!("Variant 应在 codegen 前被压平")
             }
         }
     }
@@ -67,6 +76,11 @@ impl<T: Module> Compiler<T> {
             }
             HirType::Var(_) | HirType::Generic(_, _, _) => {
                 unreachable!("单态化后不应出现泛型类型占位符")
+            }
+            HirType::Enum(def, _, _) => self.enum_align(def),
+            HirType::TraitObject(_) => self.ptr_type().bytes(), // 16B fat pointer, ptr-align
+            HirType::Variant(_, _) => {
+                unreachable!("Variant 应在 codegen 前被压平")
             }
         }
     }
@@ -107,5 +121,62 @@ impl<T: Module> Compiler<T> {
             "type mismatch in {}: expected {:?}, got {:?}",
             ctx, expected, actual
         );
+    }
+
+    pub fn enum_size(&self, enum_def: &DefId) -> u32 {
+        let layout = self.enum_map.get(enum_def).expect("unknown enum");
+        layout.size
+    }
+
+    pub fn enum_align(&self, enum_def: &DefId) -> u32 {
+        let layout = self.enum_map.get(enum_def).expect("unknown enum");
+        layout.align
+    }
+
+    pub fn variant_payload_offset(&self, enum_def: &DefId, tag: u32) -> u32 {
+        let layout = self.enum_map.get(enum_def).expect("unknown enum");
+        layout
+            .variants
+            .get(tag as usize)
+            .map(|v| v.payload_offset)
+            .unwrap_or_else(|| panic!("variant tag {} not found in enum {:?}", tag, enum_def))
+    }
+
+    pub fn variant_field_offset(&self, enum_def: &DefId, tag: u32, field_def: &DefId) -> u32 {
+        let layout = self.enum_map.get(enum_def).expect("unknown enum");
+        let variant = &layout.variants[tag as usize];
+        variant
+            .fields
+            .iter()
+            .find(|f| &f.field_def_id == field_def)
+            .map(|f| variant.payload_offset + f.offset)
+            .unwrap_or_else(|| {
+                panic!(
+                    "field {:?} not found in variant {} of enum {:?}",
+                    field_def, tag, enum_def
+                )
+            })
+    }
+
+    /// 枚举的 tag（判别式）作为 i64 写入 offset 0。
+    pub fn enum_tag_offset() -> u32 {
+        0
+    }
+
+    /// 取类型大小；对于 `Var`/`Generic`（泛型占位符）回退为 8 字节。
+    /// 枚举布局阶段使用——因为枚举的变体字段可能仍含泛型参数（monomorphize 未替换时）。
+    pub fn var_type_size_or_default(&self, ty: &HirType) -> u32 {
+        match ty {
+            HirType::Var(_) | HirType::Generic(_, _, _) => 8,
+            _ => self.var_type_size(ty),
+        }
+    }
+
+    /// 取类型对齐；对于 `Var`/`Generic` 回退为 8 字节对齐。
+    pub fn var_type_align_or_default(&self, ty: &HirType) -> u32 {
+        match ty {
+            HirType::Var(_) | HirType::Generic(_, _, _) => 8,
+            _ => self.var_type_align(ty),
+        }
     }
 }

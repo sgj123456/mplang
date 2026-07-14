@@ -112,6 +112,7 @@ impl Mono {
                 attributes: unit.root_module.attributes.clone(),
                 items: all_items,
             },
+            vtables: unit.vtables.clone(),
         }
     }
 
@@ -251,6 +252,13 @@ impl Mono {
                     });
                 }
                 tyhir::TyHirItem::ExternFn { .. } => out.push(item.clone()),
+                tyhir::TyHirItem::Enum { .. } => {
+                    // 透传枚举；变体字段类型中的 Var 由 codegen 布局阶段处理（回退为 8 字节占位）。
+                    out.push(item.clone());
+                }
+                tyhir::TyHirItem::VTable { .. } => {
+                    out.push(item.clone());
+                }
             }
         }
         out
@@ -554,6 +562,54 @@ impl Mono {
             tyhir::TyHirExprKind::Deref(inner) => tyhir::TyHirExprKind::Deref(Box::new(
                 self.mono_expr(inner, generics, targs, cargs, const_map),
             )),
+
+            tyhir::TyHirExprKind::Variant {
+                def_id,
+                variant,
+                args,
+                turbofish,
+            } => tyhir::TyHirExprKind::Variant {
+                def_id: *def_id,
+                variant: variant.clone(),
+                args: args
+                    .iter()
+                    .map(|a| self.mono_expr(a, generics, targs, cargs, const_map))
+                    .collect(),
+                turbofish: turbofish.clone(),
+            },
+
+            tyhir::TyHirExprKind::Match { scrutinee, arms } => tyhir::TyHirExprKind::Match {
+                scrutinee: Box::new(self.mono_expr(scrutinee, generics, targs, cargs, const_map)),
+                arms: arms
+                    .iter()
+                    .map(|a| tyhir::TyHirMatchArm {
+                        pattern: a.pattern.clone(),
+                        body: self.mono_body(&a.body, generics, targs, cargs, const_map),
+                    })
+                    .collect(),
+            },
+
+            tyhir::TyHirExprKind::TraitCast { value, trait_def } => {
+                tyhir::TyHirExprKind::TraitCast {
+                    value: Box::new(self.mono_expr(value, generics, targs, cargs, const_map)),
+                    trait_def: *trait_def,
+                }
+            }
+
+            tyhir::TyHirExprKind::DynamicMethodCall {
+                trait_def,
+                method_index,
+                receiver,
+                args,
+            } => tyhir::TyHirExprKind::DynamicMethodCall {
+                trait_def: *trait_def,
+                method_index: *method_index,
+                receiver: Box::new(self.mono_expr(receiver, generics, targs, cargs, const_map)),
+                args: args
+                    .iter()
+                    .map(|a| self.mono_expr(a, generics, targs, cargs, const_map))
+                    .collect(),
+            },
         };
         tyhir::TyHirExpr { ty, kind }
     }
@@ -911,6 +967,24 @@ fn collect_ids_body(b: &tyhir::TyHirBody, max: &mut u32) {
     }
 }
 
+fn collect_ids_pattern(p: &tyhir::TyHirPattern, max: &mut u32) {
+    match p {
+        tyhir::TyHirPattern::Variant { bindings, .. } => {
+            for (bdef, _) in bindings {
+                if bdef.0 > *max {
+                    *max = bdef.0;
+                }
+            }
+        }
+        tyhir::TyHirPattern::Ident(d) => {
+            if d.0 > *max {
+                *max = d.0;
+            }
+        }
+        tyhir::TyHirPattern::Wildcard | tyhir::TyHirPattern::Literal(_) => {}
+    }
+}
+
 fn collect_ids_expr(e: &tyhir::TyHirExpr, max: &mut u32) {
     match &e.kind {
         tyhir::TyHirExprKind::Path(d) => {
@@ -950,6 +1024,27 @@ fn collect_ids_expr(e: &tyhir::TyHirExpr, max: &mut u32) {
         }
         tyhir::TyHirExprKind::AddressOf(inner) | tyhir::TyHirExprKind::Deref(inner) => {
             collect_ids_expr(inner, max)
+        }
+        tyhir::TyHirExprKind::Variant { args, .. } => {
+            for a in args {
+                collect_ids_expr(a, max);
+            }
+        }
+        tyhir::TyHirExprKind::Match { scrutinee, arms } => {
+            collect_ids_expr(scrutinee, max);
+            for a in arms {
+                collect_ids_pattern(&a.pattern, max);
+                collect_ids_body(&a.body, max);
+            }
+        }
+        tyhir::TyHirExprKind::TraitCast { value, .. } => {
+            collect_ids_expr(value, max);
+        }
+        tyhir::TyHirExprKind::DynamicMethodCall { receiver, args, .. } => {
+            collect_ids_expr(receiver, max);
+            for a in args {
+                collect_ids_expr(a, max);
+            }
         }
         _ => {}
     }

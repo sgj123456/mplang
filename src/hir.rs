@@ -10,6 +10,8 @@
 //! 根据对象的类型解析为 [`DefId`]。这样分层符合编译器惯例：先解析「值/函数」
 //! 的名字，再依据类型解析「字段」的名字。
 
+use std::collections::HashMap;
+
 use crate::ast::{BinOp, GenericParam, Literal, Meta};
 
 /// 定义 ID：编译器内部用来无歧义地引用每一个定义
@@ -96,6 +98,15 @@ pub enum HirType {
     /// 例如 `List<T>` / `Pair<int, 3>`。常量实参可为 [`ConstArg::Param`]（引用外层常量参数）
     /// 或 [`ConstArg::Literal`]（具体整数），单态化后 `Param` 被解算为 `Literal` 并最终变为 [`Named`]。
     Generic(DefId, Vec<HirType>, Vec<ConstArg>),
+    /// 代数数据类型（ADT）枚举。`DefId` 指向枚举定义；后两者为泛型实参
+    /// （类型实参与常量实参），用于 `Option<T>` 这类泛型枚举。
+    Enum(DefId, Vec<HirType>, Vec<ConstArg>),
+    /// trait 对象（fat pointer）：`*Trait`。`DefId` 指向 trait 定义。
+    /// 值表示为「数据指针 + vtable 指针」的 16 字节存储（64 位下）。
+    TraitObject(DefId),
+    /// 枚举变体构造器（编译期被压平为具体 Variant 的 tag + 载荷写入）。
+    /// `DefId` 指向枚举定义，`variant` 为变体名。不应到达代码生成阶段。
+    Variant(DefId, String),
 }
 
 /// 函数 / 方法参数种类。用于区分「值参数」「类型参数」「常量参数」，
@@ -129,6 +140,8 @@ impl HirType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HirCompilationUnit {
     pub root_module: HirModule,
+    /// vtable 表：(trait_def, impl_type_def) → 按 trait 方法声明顺序排列的具体方法 DefId 列表。
+    pub vtables: HashMap<(DefId, DefId), Vec<DefId>>,
 }
 
 /// 模块：一组 item。顶层源码整体构成一个根模块。
@@ -193,6 +206,16 @@ pub enum HirItem {
         fields: Vec<HirField>,
     },
 
+    /// 枚举（ADT）定义。`variants` 按声明顺序携带 `tag` 序号与载荷字段。
+    Enum {
+        def_id: DefId,
+        visibility: Visibility,
+        attributes: Vec<Meta>,
+        name: String,
+        generics: Vec<GenericParam>,
+        variants: Vec<HirEnumVariant>,
+    },
+
     /// 全局变量（`static`）或编译期常量（`const`）。
     Static {
         def_id: DefId,
@@ -221,6 +244,16 @@ pub struct HirField {
     pub name: String,
     pub ty: HirType,
     pub visibility: Visibility,
+}
+
+/// 枚举的一个变体。`tag` 为其声明序号（0, 1, 2, ...）；
+/// `fields` 为载荷字段（单元变体为空）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirEnumVariant {
+    pub def_id: DefId,
+    pub name: String,
+    pub tag: u32,
+    pub fields: Vec<HirField>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,4 +359,44 @@ pub enum HirExpr {
         name: String,
         args: Vec<HirExpr>,
     },
+
+    /// 枚举变体构造：`Some(x)` / `None`。`def_id` 指向枚举定义；`variant` 为变体名；
+    /// `args` 为载荷实参。代码生成阶段被展开为「写 tag + 写载荷」的存储写入。
+    Variant {
+        def_id: DefId,
+        variant: String,
+        args: Vec<HirExpr>,
+        turbofish: Vec<TypeOrConst>,
+    },
+
+    /// 模式匹配表达式 `match scrutinee { ... }`。
+    Match {
+        scrutinee: Box<HirExpr>,
+        arms: Vec<HirMatchArm>,
+    },
+}
+
+/// `match` 的一个分支（HIR 层）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HirMatchArm {
+    pub pattern: HirPattern,
+    pub body: HirBody,
+}
+
+/// `match` 的模式（HIR 层；变体模式的绑定已解析为 [`DefId`]，并带字段类型）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HirPattern {
+    /// 变体模式。`enum_def` 为枚举定义 [`DefId`]；`variant` 为变体名；
+    /// `bindings` 为 `(绑定 DefId, 可选字段类型)`。
+    Variant {
+        enum_def: DefId,
+        variant: String,
+        bindings: Vec<(DefId, Option<HirType>)>,
+    },
+    /// 字面量模式（仅 int / 字符串字面量）。
+    Literal(Literal),
+    /// 通配模式 `_`。
+    Wildcard,
+    /// 裸标识符模式（绑定整个 scrutinee 值）。
+    Ident(DefId),
 }

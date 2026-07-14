@@ -14,7 +14,13 @@ impl<T: Module> Compiler<T> {
         let mut sig = self.module.make_signature();
         sig.call_conv = default_call_conv();
 
-        if matches!(ret_ty, HirType::Named(_) | HirType::Array(_, _)) {
+        if matches!(
+            ret_ty,
+            HirType::Named(_)
+                | HirType::Array(_, _)
+                | HirType::Enum(_, _, _)
+                | HirType::TraitObject(_)
+        ) {
             sig.params.push(AbiParam::new(self.ptr_type()));
         }
 
@@ -30,7 +36,13 @@ impl<T: Module> Compiler<T> {
             }
         }
 
-        if !matches!(ret_ty, HirType::Named(_) | HirType::Array(_, _)) {
+        if !matches!(
+            ret_ty,
+            HirType::Named(_)
+                | HirType::Array(_, _)
+                | HirType::Enum(_, _, _)
+                | HirType::TraitObject(_)
+        ) {
             sig.returns
                 .push(AbiParam::new(self.var_type_to_cranelift(ret_ty)));
         }
@@ -39,7 +51,13 @@ impl<T: Module> Compiler<T> {
     }
 
     pub fn needs_sret(ret_ty: &HirType) -> bool {
-        matches!(ret_ty, HirType::Named(_) | HirType::Array(_, _))
+        matches!(
+            ret_ty,
+            HirType::Named(_)
+                | HirType::Array(_, _)
+                | HirType::Enum(_, _, _)
+                | HirType::TraitObject(_)
+        )
     }
 }
 

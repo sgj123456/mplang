@@ -84,6 +84,9 @@ pub enum TokenKind {
     Crate,
     Impl,
     Trait,
+    Enum,
+    Match,
+    FatArrow,
 
     // Identifier
     Ident,

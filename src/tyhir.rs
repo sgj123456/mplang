@@ -14,6 +14,8 @@
 //! 换言之，TYPE HIR = HIR + 类型标注 + 字段解析结果。它是「信任边界」：
 //! 经过 TyHIR 后的程序保证类型良好，后端只需照着它生成机器码即可。
 
+use std::collections::HashMap;
+
 use crate::ast::{BinOp, GenericParam, Literal, Meta};
 use crate::hir::{DefId, HirType, ParamKind, TypeOrConst, Visibility};
 
@@ -21,6 +23,9 @@ use crate::hir::{DefId, HirType, ParamKind, TypeOrConst, Visibility};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TyHirCompilationUnit {
     pub root_module: TyHirModule,
+    /// vtable 表：(trait_def, impl_type_def) → 按 trait 方法声明顺序排列的具体方法 DefId 列表。
+    /// codegen 阶段据此发射函数指针数组。
+    pub vtables: HashMap<(DefId, DefId), Vec<DefId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +80,15 @@ pub enum TyHirItem {
         fields: Vec<TyHirField>,
     },
 
+    Enum {
+        def_id: DefId,
+        visibility: Visibility,
+        attributes: Vec<Meta>,
+        name: String,
+        generics: Vec<GenericParam>,
+        variants: Vec<TyHirEnumVariant>,
+    },
+
     Static {
         def_id: DefId,
         visibility: Visibility,
@@ -83,6 +97,15 @@ pub enum TyHirItem {
         ty: HirType,
         init: TyHirExpr,
         is_const: bool,
+    },
+
+    /// vtable 表。`trait_def` 为 trait 定义 ID；`impl_type_def` 为实现方类型定义 ID；
+    /// `methods` 为按 trait 方法声明顺序排列的具体方法 [`DefId`] 列表。
+    /// codegen 阶段据此发射函数指针数组。
+    VTable {
+        trait_def: DefId,
+        impl_type_def: DefId,
+        methods: Vec<DefId>,
     },
 }
 
@@ -102,6 +125,14 @@ pub struct TyHirField {
     pub name: String,
     pub ty: HirType,
     pub visibility: Visibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TyHirEnumVariant {
+    pub def_id: DefId,
+    pub name: String,
+    pub tag: u32,
+    pub fields: Vec<TyHirField>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,4 +235,53 @@ pub enum TyHirExprKind {
 
     /// 解引用 `*p`：读取（或作为赋值目标写入）`p` 所指向的值，类型为指针的承载类型。
     Deref(Box<TyHirExpr>),
+
+    /// 枚举变体构造。`def_id` 为枚举定义 DefId；`variant` 为变体名；`args` 为载荷实参。
+    /// 整个表达式类型为 `HirType::Enum(def_id, targs, cargs)`。
+    Variant {
+        def_id: DefId,
+        variant: String,
+        args: Vec<TyHirExpr>,
+        turbofish: Vec<TypeOrConst>,
+    },
+
+    /// `match` 表达式。`scrutinee_ty` 为被匹配值的类型（`Enum` 或 `Int`）。
+    Match {
+        scrutinee: Box<TyHirExpr>,
+        arms: Vec<TyHirMatchArm>,
+    },
+
+    /// 将 `value`（一个实现了 trait `trait_def` 的 struct 值）转换为 trait 对象。
+    TraitCast {
+        value: Box<TyHirExpr>,
+        trait_def: DefId,
+    },
+
+    /// 对 trait 对象的动态方法调用。`method_index` 为该方法在 trait 方法声明中的序号；
+    /// `receiver` 为 trait 对象值（fat pointer）；`args` 为除 self 外的其余实参。
+    /// 返回类型在 `ty` 字段中。
+    DynamicMethodCall {
+        trait_def: DefId,
+        method_index: usize,
+        receiver: Box<TyHirExpr>,
+        args: Vec<TyHirExpr>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TyHirMatchArm {
+    pub pattern: TyHirPattern,
+    pub body: TyHirBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TyHirPattern {
+    Variant {
+        enum_def: DefId,
+        variant: String,
+        bindings: Vec<(DefId, Option<HirType>)>,
+    },
+    Literal(Literal),
+    Wildcard,
+    Ident(DefId),
 }

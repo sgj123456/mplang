@@ -1,6 +1,7 @@
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{MemFlagsData, StackSlotData, StackSlotKind};
 use cranelift_frontend::{FunctionBuilder, Variable};
+use cranelift_module::DataDescription;
 use cranelift_module::{Linkage, Module};
 
 use super::{Compiler, FuncInfo, StructFieldLayout};
@@ -66,6 +67,74 @@ impl<T: Module> Compiler<T> {
             }
         });
 
+        // Pass 2.5：枚举布局。
+        Self::walk_items(&root.items, &mut |item| {
+            if let tyhir::TyHirItem::Enum {
+                def_id, variants, ..
+            } = item
+            {
+                let tag_size: u32 = 8; // i64
+                let tag_align: u32 = 8;
+                let mut enum_variants: Vec<super::VariantLayout> =
+                    Vec::with_capacity(variants.len());
+                let mut max_payload_size: u32 = 0;
+                let mut max_payload_align: u32 = tag_align;
+                for v in variants {
+                    let mut fields: Vec<StructFieldLayout> = Vec::new();
+                    let mut offset: u32 = 0;
+                    for f in &v.fields {
+                        let align = self.var_type_align_or_default(&f.ty);
+                        offset = (offset + align - 1) & !(align - 1);
+                        fields.push(StructFieldLayout {
+                            field_def_id: f.def_id,
+                            field_type: f.ty.clone(),
+                            offset,
+                        });
+                        offset += self.var_type_size_or_default(&f.ty);
+                    }
+                    let payload_align = fields
+                        .iter()
+                        .map(|f| self.var_type_align_or_default(&f.field_type))
+                        .max()
+                        .unwrap_or(1);
+                    if payload_align > max_payload_align {
+                        max_payload_align = payload_align;
+                    }
+                    let payload_size = (offset + payload_align - 1) & !(payload_align - 1);
+                    if payload_size > max_payload_size {
+                        max_payload_size = payload_size;
+                    }
+                    enum_variants.push(super::VariantLayout {
+                        name: v.name.clone(),
+                        tag: v.tag,
+                        payload_offset: tag_size,
+                        payload_size,
+                        fields,
+                    });
+                }
+                // 整体大小 = tag(8) + 最大载荷，再按最大对齐取整
+                let total = tag_size + max_payload_size;
+                let align = if max_payload_align > tag_align {
+                    max_payload_align
+                } else {
+                    tag_align
+                };
+                let enum_size = (total + align - 1) & !(align - 1);
+                self.enum_map.insert(
+                    *def_id,
+                    super::EnumLayout {
+                        variants: enum_variants,
+                        size: enum_size,
+                        align,
+                        max_payload_align,
+                    },
+                );
+            }
+        });
+
+        // Pass 2.75：枚举布局。
+        // (already done above)
+
         // Pass 3：外部函数声明。
         Self::walk_items(&root.items, &mut |item| {
             if let tyhir::TyHirItem::ExternFn {
@@ -111,6 +180,37 @@ impl<T: Module> Compiler<T> {
         for item in &fn_items {
             self.declare_function(item);
         }
+
+        // Pass 4.5：vtable 发射（需在函数声明之后，确保 func_map 已完整）。
+        let ptr_bytes = self.ptr_type().bytes();
+        for ((trait_def, impl_type_def), methods) in &prog.vtables {
+            let data_name = format!("__vtable_{}_{}", trait_def.0, impl_type_def.0);
+            let data_id = self
+                .module
+                .declare_data(&data_name, Linkage::Local, false, false)
+                .unwrap_or_else(|e| panic!("failed to declare vtable data '{}': {}", data_name, e));
+            let mut data_ctx = DataDescription::new();
+            // 初始化 vtable 数据大小（n 个函数指针）
+            let n_methods = methods.len();
+            let data_size = (n_methods as u32) * ptr_bytes;
+            data_ctx.define_zeroinit(data_size as usize);
+            // 写入函数指针地址（通过重定位条目）。
+            for (i, method_def_id) in methods.iter().enumerate() {
+                let func_id = self
+                    .func_map
+                    .get(method_def_id)
+                    .unwrap_or_else(|| panic!("vtable method {:?} not in func_map", method_def_id))
+                    .func_id;
+                let func_ref = self.module.declare_func_in_data(func_id, &mut data_ctx);
+                data_ctx.write_function_addr((i as u32) * ptr_bytes, func_ref);
+            }
+            self.module
+                .define_data(data_id, &data_ctx)
+                .unwrap_or_else(|e| panic!("failed to define vtable data '{}': {}", data_name, e));
+            self.vtable_map
+                .insert((*trait_def, *impl_type_def), data_id);
+        }
+
         for item in &fn_items {
             self.define_function(item);
         }
@@ -129,7 +229,14 @@ impl<T: Module> Compiler<T> {
         val: Value,
         addr_taken: bool,
     ) -> LocalVar {
-        let addr_taken = addr_taken && !matches!(ty, HirType::Named(_) | HirType::Array(_, _));
+        let addr_taken = addr_taken
+            && !matches!(
+                ty,
+                HirType::Named(_)
+                    | HirType::Array(_, _)
+                    | HirType::Enum(_, _, _)
+                    | HirType::TraitObject(_)
+            );
         if addr_taken {
             let size = self.var_type_size(ty);
             let align = self.var_type_align(ty) as u8;

@@ -1,7 +1,8 @@
 use crate::error::MplangError;
 use crate::{
     ast::{
-        GenericParam, GenericParamKind, ImplMethod, Meta, Param, TopLevelDecl, TraitMethod, Type,
+        EnumVariant, GenericParam, GenericParamKind, ImplMethod, Meta, Param, TopLevelDecl,
+        TraitMethod, Type,
     },
     token::TokenKind,
 };
@@ -37,6 +38,9 @@ impl Parser {
         }
         if self.check(&TokenKind::Struct) {
             return self.struct_decl(attributes);
+        }
+        if self.check(&TokenKind::Enum) {
+            return self.enum_decl(attributes);
         }
         if self.check(&TokenKind::Impl) {
             return self.impl_decl(attributes);
@@ -394,6 +398,69 @@ impl Parser {
             name,
             generics,
             fields,
+        }
+    }
+
+    fn enum_decl(&mut self, attributes: Vec<Meta>) -> TopLevelDecl {
+        self.consume(TokenKind::Enum, "Expected 'enum'");
+        let name = self
+            .consume(TokenKind::Ident, "Expected enum name")
+            .lexeme
+            .clone();
+        // 枚举名之后可跟泛型参数列表 `<T, E>`。
+        let generics = if self.check(&TokenKind::Less) {
+            self.parse_generics()
+        } else {
+            Vec::new()
+        };
+        self.consume(TokenKind::LeftBrace, "Expected '{' after enum name");
+
+        let mut variants = Vec::new();
+        while !self.is_at_end() && !self.check(&TokenKind::RightBrace) {
+            let variant_name = self
+                .consume(TokenKind::Ident, "Expected variant name")
+                .lexeme
+                .clone();
+            // 变体可带载荷：`Some(T)` / `Pair(x:int, y:int)`，或单元变体 `None`。
+            let fields = if self.check(&TokenKind::LeftParen) {
+                self.advance();
+                let mut fs = Vec::new();
+                while !self.is_at_end() && !self.check(&TokenKind::RightParen) {
+                    let fname = self
+                        .consume(TokenKind::Ident, "Expected field name")
+                        .lexeme
+                        .clone();
+                    self.consume(TokenKind::Colon, "Expected ':' after field name");
+                    let fty = self.parse_type();
+                    fs.push((fname, fty));
+                    if self.check(&TokenKind::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.consume(TokenKind::RightParen, "Expected ')' after variant fields");
+                fs
+            } else {
+                Vec::new()
+            };
+            variants.push(EnumVariant {
+                name: variant_name,
+                fields,
+            });
+            if self.check(&TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.consume(TokenKind::RightBrace, "Expected '}' after enum variants");
+
+        TopLevelDecl::Enum {
+            attributes,
+            name,
+            generics,
+            variants,
         }
     }
 

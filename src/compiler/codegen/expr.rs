@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use cranelift::prelude::*;
-use cranelift_codegen::ir::{ExtFuncData, MemFlagsData, StackSlotData, StackSlotKind};
+use cranelift_codegen::ir::{BlockArg, ExtFuncData, MemFlagsData, StackSlotData, StackSlotKind};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 
@@ -68,6 +68,8 @@ impl<T: Module> Compiler<T> {
                         HirType::Var(_) | HirType::Generic(_, _, _) => {
                             unreachable!("单态化后不应出现泛型类型占位符")
                         }
+                        HirType::Enum(_, _, _) | HirType::TraitObject(_) => addr,
+                        HirType::Variant(_, _) => unreachable!("Variant 不应到达此路径"),
                     };
                 }
                 panic!("undefined variable {:?}", def_id);
@@ -310,6 +312,334 @@ impl<T: Module> Compiler<T> {
             tyhir::TyHirExprKind::AddressOf(inner) => {
                 // 取地址：返回操作数的存储地址。
                 self.translate_lvalue(builder, inner, var_map)
+            }
+
+            tyhir::TyHirExprKind::Variant {
+                def_id,
+                variant,
+                args,
+                turbofish: _,
+            } => {
+                let layout = self.enum_map.get(def_id).expect("unknown enum").clone();
+                let var_layout = layout
+                    .variants
+                    .iter()
+                    .find(|v| v.name == *variant)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("variant {} not in enum {:?}", variant, def_id));
+                let size = layout.size;
+                let align = layout.align as u8;
+                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    size,
+                    align,
+                ));
+                let base = builder.ins().stack_addr(self.ptr_type(), slot, 0);
+                // 写 tag（i64，offset 0）
+                let tag_val = builder.ins().iconst(types::I64, var_layout.tag as i64);
+                builder.ins().store(MemFlagsData::new(), tag_val, base, 0);
+                // 写载荷字段
+                let payload_base = var_layout.payload_offset as i64;
+                for (arg, field) in args.iter().zip(var_layout.fields.iter()) {
+                    // 用 arg 的实际类型而非 field.field_type（后者可能含 Var 占位符）
+                    let val = self.translate_expr(builder, arg, var_map, &arg.ty);
+                    let val = self.copy_value(builder, val, &arg.ty);
+                    let field_addr = builder
+                        .ins()
+                        .iadd_imm(base, payload_base + field.offset as i64);
+                    builder.ins().store(MemFlagsData::new(), val, field_addr, 0);
+                }
+                // Enum 的值就是指向这个栈槽的指针
+                base
+            }
+            tyhir::TyHirExprKind::Match { scrutinee, arms } => {
+                let ptr_ty_local = self.ptr_type();
+                let merge_block = builder.create_block();
+                builder.append_block_param(merge_block, ptr_ty_local);
+
+                // 为每个 arm 创建一个 block
+                let n_arms = arms.len();
+                let mut arm_blocks: Vec<Block> = Vec::with_capacity(n_arms);
+                for _ in 0..n_arms {
+                    arm_blocks.push(builder.create_block());
+                }
+
+                // 翻译 scrutinee
+                let scrutinee_raw = self.translate_expr(builder, scrutinee, var_map, &scrutinee.ty);
+                let is_enum_match = matches!(&scrutinee.ty, HirType::Enum(_, _, _));
+                let scrutinee_val = if is_enum_match {
+                    // 枚举值是指针：copy_value 保持地址
+                    self.copy_value(builder, scrutinee_raw, &scrutinee.ty)
+                } else {
+                    // int 值：直接使用
+                    scrutinee_raw
+                };
+
+                // 为每个臂生成「检查 → 跳转到对应 arm block」的代码链
+                for (arm_idx, arm) in arms.iter().enumerate() {
+                    let this_arm_block = arm_blocks[arm_idx];
+
+                    match &arm.pattern {
+                        tyhir::TyHirPattern::Wildcard | tyhir::TyHirPattern::Ident(_) => {
+                            // 通配/标识符总是匹配：直接跳转到 arm block
+                            builder.ins().jump(this_arm_block, &[]);
+                            break; // 后续臂不可达
+                        }
+                        tyhir::TyHirPattern::Variant {
+                            enum_def,
+                            variant,
+                            bindings: _,
+                        } => {
+                            let layout = self.enum_map.get(enum_def).expect("unknown enum");
+                            let var_layout = layout
+                                .variants
+                                .iter()
+                                .find(|v| v.name == *variant)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    panic!("variant {} not found in enum {:?}", variant, enum_def)
+                                });
+
+                            let tag_val = builder.ins().load(
+                                types::I64,
+                                MemFlagsData::new(),
+                                scrutinee_val,
+                                0,
+                            );
+                            let variant_tag =
+                                builder.ins().iconst(types::I64, var_layout.tag as i64);
+                            let cmp = builder.ins().icmp(IntCC::Equal, tag_val, variant_tag);
+
+                            if arm_idx + 1 < n_arms {
+                                let _next_arm_block = arm_blocks[arm_idx + 1];
+                                let fallthrough = builder.create_block();
+                                builder
+                                    .ins()
+                                    .brif(cmp, this_arm_block, &[], fallthrough, &[]);
+                                builder.switch_to_block(fallthrough);
+                                builder.seal_block(fallthrough);
+                            } else {
+                                let zero = builder.ins().iconst(ptr_ty_local, 0);
+                                builder.ins().brif(
+                                    cmp,
+                                    this_arm_block,
+                                    &[],
+                                    merge_block,
+                                    &[BlockArg::Value(zero)],
+                                );
+                            }
+                        }
+                        tyhir::TyHirPattern::Literal(lit) => {
+                            // int 匹配：scrutinee_val 就是整数值，直接比较
+                            let lit_val = match lit {
+                                Literal::Int(v) => builder.ins().iconst(types::I64, *v),
+                                Literal::String(_) => {
+                                    panic!("字符串字面量不能用作 match 模式")
+                                }
+                            };
+                            let cmp = builder.ins().icmp(IntCC::Equal, scrutinee_val, lit_val);
+
+                            if arm_idx + 1 < n_arms {
+                                let _next_arm_block = arm_blocks[arm_idx + 1];
+                                let fallthrough = builder.create_block();
+                                builder
+                                    .ins()
+                                    .brif(cmp, this_arm_block, &[], fallthrough, &[]);
+                                builder.switch_to_block(fallthrough);
+                                builder.seal_block(fallthrough);
+                            } else {
+                                let zero = builder.ins().iconst(ptr_ty_local, 0);
+                                builder.ins().brif(
+                                    cmp,
+                                    this_arm_block,
+                                    &[],
+                                    merge_block,
+                                    &[BlockArg::Value(zero)],
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // 填充每个 arm block 的 body
+                for (arm, arm_block) in arms.iter().zip(arm_blocks.iter()) {
+                    builder.switch_to_block(*arm_block);
+                    builder.seal_block(*arm_block);
+
+                    let mut arm_var_map = var_map.clone();
+
+                    // 处理模式绑定
+                    match &arm.pattern {
+                        tyhir::TyHirPattern::Variant {
+                            enum_def,
+                            variant,
+                            bindings,
+                        } => {
+                            let layout = self.enum_map.get(enum_def).expect("unknown enum");
+                            let var_layout = layout
+                                .variants
+                                .iter()
+                                .find(|v| v.name == *variant)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    panic!("variant {} not found in enum {:?}", variant, enum_def)
+                                });
+                            for (field_idx, (bdef, _bty)) in bindings.iter().enumerate() {
+                                let field_info = &var_layout.fields[field_idx];
+                                let field_offset =
+                                    (var_layout.payload_offset + field_info.offset) as i64;
+                                let field_addr =
+                                    builder.ins().iadd_imm(scrutinee_val, field_offset);
+                                // 字段类型可能含 Var（泛型占位符），此时按 8 字节 i64 处理
+                                let (field_clif_ty, bind_ty) = if matches!(
+                                    field_info.field_type,
+                                    HirType::Var(_) | HirType::Generic(_, _, _)
+                                ) {
+                                    (types::I64, HirType::Int)
+                                } else {
+                                    (
+                                        self.var_type_to_cranelift(&field_info.field_type),
+                                        field_info.field_type.clone(),
+                                    )
+                                };
+                                let field_val = builder.ins().load(
+                                    field_clif_ty,
+                                    MemFlagsData::new(),
+                                    field_addr,
+                                    0,
+                                );
+                                let local = self.bind_local(builder, &bind_ty, field_val, false);
+                                arm_var_map.insert(*bdef, local);
+                            }
+                        }
+                        tyhir::TyHirPattern::Ident(bdef) => {
+                            // Ident 绑定整个 scrutinee
+                            let local =
+                                self.bind_local(builder, &scrutinee.ty, scrutinee_val, false);
+                            arm_var_map.insert(*bdef, local);
+                        }
+                        tyhir::TyHirPattern::Wildcard | tyhir::TyHirPattern::Literal(_) => {}
+                    }
+
+                    let body_val = self.translate_stmts(
+                        builder,
+                        &arm.body.stmts,
+                        &mut arm_var_map,
+                        &HirType::Unit,
+                        None,
+                        &Default::default(),
+                    );
+                    let jump_val = if expr.ty == HirType::Unit {
+                        builder.ins().iconst(ptr_ty_local, 0)
+                    } else {
+                        body_val
+                    };
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(jump_val)]);
+                }
+
+                // 切换到 merge 块并封口
+                builder.switch_to_block(merge_block);
+                builder.seal_block(merge_block);
+
+                builder.block_params(merge_block)[0]
+            }
+            tyhir::TyHirExprKind::TraitCast { value, trait_def } => {
+                // TraitCast 的 expr.ty 是 TraitObject(trait_def)，
+                // 但这里我们需要返回一个 fat pointer 的地址（16 字节栈槽）。
+                // 先翻译 value（应是 Named(struct_def) 类型的结构体指针）
+                let data_ptr = self.translate_expr(builder, value, var_map, &value.ty);
+                // 从 value.ty 获取 struct_def
+                let struct_def = match &value.ty {
+                    HirType::Named(d) => *d,
+                    _ => unreachable!("TraitCast value must be a Named struct type"),
+                };
+                // 查找 vtable 的数据 ID
+                let data_id = self
+                    .vtable_map
+                    .get(&(*trait_def, struct_def))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "vtable not found for trait {:?} + struct {:?}",
+                            trait_def, struct_def
+                        )
+                    });
+                let vtable_addr = {
+                    let gv = self.module.declare_data_in_func(*data_id, builder.func);
+                    builder.ins().symbol_value(self.ptr_type(), gv)
+                };
+                // 创建 16 字节栈槽存放 fat pointer: [data_ptr, vtable_ptr]
+                let ptr_bytes_i64 = self.ptr_type().bytes() as i64;
+                let ptr_bytes_i32 = self.ptr_type().bytes() as i32;
+                let size = (ptr_bytes_i64 * 2) as u32;
+                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    size,
+                    8,
+                ));
+                let base = builder.ins().stack_addr(self.ptr_type(), slot, 0);
+                builder.ins().store(MemFlagsData::new(), data_ptr, base, 0);
+                builder
+                    .ins()
+                    .store(MemFlagsData::new(), vtable_addr, base, ptr_bytes_i32);
+                base
+            }
+
+            tyhir::TyHirExprKind::DynamicMethodCall {
+                trait_def: _,
+                method_index,
+                receiver,
+                args,
+            } => {
+                // receiver 的 expr.ty 是 TraitObject(trait_def)，其值是一个 fat pointer
+                // 的地址（栈槽指针，包含 [data_ptr, vtable_ptr]）。
+                let receiver_val = self.translate_expr(builder, receiver, var_map, &receiver.ty);
+                let _ptr_bytes_i64 = self.ptr_type().bytes() as i64;
+                let ptr_bytes_i32 = self.ptr_type().bytes() as i32;
+                // 从 fat pointer 中加载 data_ptr (offset 0) 和 vtable_ptr (offset ptr_bytes)
+                let data_ptr =
+                    builder
+                        .ins()
+                        .load(self.ptr_type(), MemFlagsData::new(), receiver_val, 0);
+                let vtable_ptr = builder.ins().load(
+                    self.ptr_type(),
+                    MemFlagsData::new(),
+                    receiver_val,
+                    ptr_bytes_i32,
+                );
+                // 从 vtable 加载方法函数指针：offset = method_index * ptr_bytes
+                let method_fn_ptr = builder.ins().load(
+                    self.ptr_type(),
+                    MemFlagsData::new(),
+                    vtable_ptr,
+                    (*method_index as i32) * ptr_bytes_i32,
+                );
+                // 构建调用签名：self(data_ptr) + args
+                let sig = self.module.make_signature();
+                let mut sig = sig;
+                sig.params
+                    .push(cranelift_codegen::ir::AbiParam::new(self.ptr_type())); // self/data ptr
+                for a in args {
+                    sig.params.push(cranelift_codegen::ir::AbiParam::new(
+                        self.var_type_to_cranelift(&a.ty),
+                    ));
+                }
+                sig.returns
+                    .push(cranelift_codegen::ir::AbiParam::new(types::I64));
+                let sig_ref = builder.import_signature(sig);
+                // 生成间接调用
+                let mut arg_vals: Vec<Value> = Vec::with_capacity(1 + args.len());
+                arg_vals.push(data_ptr);
+                for a in args {
+                    let raw = self.translate_expr(builder, a, var_map, &a.ty);
+                    arg_vals.push(self.copy_value(builder, raw, &a.ty));
+                }
+                let call_inst = builder
+                    .ins()
+                    .call_indirect(sig_ref, method_fn_ptr, &arg_vals);
+                self.assert_ty(&HirType::Int, expected_ty, "DynamicMethodCall result");
+                builder.inst_results(call_inst)[0]
             }
         }
     }

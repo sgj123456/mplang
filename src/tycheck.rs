@@ -61,6 +61,25 @@ pub struct TypeChecker {
     def_types: HashMap<DefId, HirType>,
     /// 所有定义的 ID → 名字（仅用于报错信息）。
     names: HashMap<DefId, String>,
+    /// 枚举定义 ID → 变体信息（用于变体构造与 match 类型检查）。
+    enum_variants: HashMap<DefId, Vec<EnumVariantInfo>>,
+    /// match 表达式类型检查的临时缓存：check_enum_match/check_int_match 将已类型检查的
+    /// 分支列表存入此处，由 check_expr 中的 HirExpr::Match 分支取走。
+    typed_arms: Option<Vec<crate::tyhir::TyHirMatchArm>>,
+    /// trait 定义 ID → (方法名, 返回类型) 列表。用于 DynamicMethodCall 的返回类型推断。
+    #[allow(dead_code)]
+    trait_methods: HashMap<DefId, Vec<(String, HirType)>>,
+    /// 期望的变体构造结果类型（由 let 绑定等上下文设置，用于 `None` 等无参泛型变体的类型推断）。
+    variant_expected_type: Option<HirType>,
+}
+
+/// 枚举变体的元信息（类型检查阶段使用）。
+#[derive(Clone)]
+struct EnumVariantInfo {
+    name: String,
+    tag: u32,
+    /// 载荷字段（名称 → (DefId, 类型)）。
+    fields: Vec<(String, DefId, HirType)>,
 }
 
 impl TypeChecker {
@@ -74,6 +93,10 @@ impl TypeChecker {
             method_table: HashMap::new(),
             def_types: HashMap::new(),
             names: HashMap::new(),
+            enum_variants: HashMap::new(),
+            typed_arms: None,
+            trait_methods: HashMap::new(),
+            variant_expected_type: None,
         }
     }
 
@@ -108,6 +131,29 @@ impl TypeChecker {
                     })
                     .collect();
                 self.struct_fields.insert(*def_id, infos);
+            }
+            hir::HirItem::Enum {
+                def_id,
+                name,
+                generics,
+                variants,
+                ..
+            } => {
+                self.names.insert(*def_id, name.clone());
+                self.struct_generics.insert(*def_id, generics.clone());
+                let infos = variants
+                    .iter()
+                    .map(|v| EnumVariantInfo {
+                        name: v.name.clone(),
+                        tag: v.tag,
+                        fields: v
+                            .fields
+                            .iter()
+                            .map(|f| (f.name.clone(), f.def_id, f.ty.clone()))
+                            .collect(),
+                    })
+                    .collect();
+                self.enum_variants.insert(*def_id, infos);
             }
             hir::HirItem::ExternFn {
                 def_id,
@@ -192,7 +238,10 @@ impl TypeChecker {
         self.collect_module(&hir.root_module);
         let root = self.check_module(&hir.root_module);
         log::debug!("类型检查完成");
-        crate::tyhir::TyHirCompilationUnit { root_module: root }
+        crate::tyhir::TyHirCompilationUnit {
+            root_module: root,
+            vtables: hir.vtables.clone(),
+        }
     }
 
     fn check_module(&mut self, m: &hir::HirModule) -> crate::tyhir::TyHirModule {
@@ -315,6 +364,42 @@ impl TypeChecker {
                     is_const: *is_const,
                 }
             }
+
+            hir::HirItem::Enum {
+                def_id,
+                visibility,
+                attributes,
+                name,
+                generics,
+                variants,
+            } => {
+                // 枚举的类型检查在 Step 2 中实现；此处仅传递结构。
+                crate::tyhir::TyHirItem::Enum {
+                    def_id: *def_id,
+                    visibility: visibility.clone(),
+                    attributes: attributes.clone(),
+                    name: name.clone(),
+                    generics: generics.clone(),
+                    variants: variants
+                        .iter()
+                        .map(|v| crate::tyhir::TyHirEnumVariant {
+                            def_id: v.def_id,
+                            name: v.name.clone(),
+                            tag: v.tag,
+                            fields: v
+                                .fields
+                                .iter()
+                                .map(|f| crate::tyhir::TyHirField {
+                                    def_id: f.def_id,
+                                    name: f.name.clone(),
+                                    ty: f.ty.clone(),
+                                    visibility: f.visibility.clone(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                }
+            }
         }
     }
 
@@ -336,7 +421,32 @@ impl TypeChecker {
                 ty,
                 init,
             } => {
+                // 若有类型标注，将其设为期望的变体构造结果类型（用于 `None` 等无参泛型变体的类型推断）。
+                if let Some(expected_ty) = ty {
+                    self.variant_expected_type = Some(expected_ty.clone());
+                }
                 let init_ty = self.check_expr(init);
+                self.variant_expected_type = None;
+                // 检测 TraitCast 模式：let v: *Trait = &struct_expr;
+                let init_ty = if let Some(HirType::TraitObject(trait_def)) = ty {
+                    if let crate::tyhir::TyHirExprKind::AddressOf(inner) = &init_ty.kind {
+                        if matches!(inner.ty, HirType::Named(_)) {
+                            crate::tyhir::TyHirExpr {
+                                ty: HirType::TraitObject(*trait_def),
+                                kind: crate::tyhir::TyHirExprKind::TraitCast {
+                                    value: inner.clone(),
+                                    trait_def: *trait_def,
+                                },
+                            }
+                        } else {
+                            init_ty
+                        }
+                    } else {
+                        init_ty
+                    }
+                } else {
+                    init_ty
+                };
                 let binding_ty = match ty {
                     Some(t) => {
                         self.assert_ty(&init_ty.ty, t, &format!("let `{}` 类型标注", name));
@@ -420,6 +530,15 @@ impl TypeChecker {
             }
 
             hir::HirExpr::Path(def_id) => {
+                // 若该 DefId 是某个枚举的单元变体构造器（如 `None`），当作无参 Variant 处理。
+                if let Some((enum_def, variant)) = self.find_variant_by_def_id(*def_id) {
+                    return self.check_expr(&hir::HirExpr::Variant {
+                        def_id: enum_def,
+                        variant,
+                        args: Vec::new(),
+                        turbofish: Vec::new(),
+                    });
+                }
                 let ty = if let Some(t) = self.def_types.get(def_id) {
                     t.clone()
                 } else if self.func_sigs.contains_key(def_id) {
@@ -475,8 +594,27 @@ impl TypeChecker {
             }
 
             hir::HirExpr::MethodCall { object, name, args } => {
-                // 先算出接收者类型，再据此解析方法。
+                // 先算出接收者类型
                 let obj = self.check_expr(object);
+
+                // 若接收者是 trait 对象，产生动态方法调用
+                if let HirType::TraitObject(trait_def) = &obj.ty {
+                    // 对 trait 对象的方法调用：动态分发
+                    // v1 简化：方法索引固定为 0，返回类型固定为 Int
+                    let typed_args: Vec<crate::tyhir::TyHirExpr> =
+                        args.iter().map(|a| self.check_expr(a)).collect();
+                    let _ = name;
+                    return crate::tyhir::TyHirExpr {
+                        ty: HirType::Int,
+                        kind: crate::tyhir::TyHirExprKind::DynamicMethodCall {
+                            trait_def: *trait_def,
+                            method_index: 0,
+                            receiver: Box::new(obj),
+                            args: typed_args,
+                        },
+                    };
+                }
+
                 let callee = self
                     .method_table
                     .get(&MethodKey(obj.ty.clone(), name.clone()))
@@ -798,6 +936,324 @@ impl TypeChecker {
                     kind: crate::tyhir::TyHirExprKind::Deref(Box::new(te)),
                 }
             }
+
+            hir::HirExpr::Variant {
+                def_id,
+                variant,
+                args,
+                turbofish,
+            } => {
+                let infos = self.enum_variants.get(def_id).cloned().unwrap_or_else(|| {
+                    fatal(MplangError::type_error(format!(
+                        "未定义的枚举 `{}`",
+                        self.name_of(def_id)
+                    )))
+                });
+                let var_info = infos
+                    .iter()
+                    .find(|v| v.name == *variant)
+                    .unwrap_or_else(|| {
+                        fatal(MplangError::type_error(format!(
+                            "枚举 `{}` 没有变体 `{}`",
+                            self.name_of(def_id),
+                            variant
+                        )))
+                    });
+                if args.len() != var_info.fields.len() {
+                    fatal(MplangError::type_error(format!(
+                        "变体 `{}::{}` 需要 {} 个参数，实际给了 {}",
+                        self.name_of(def_id),
+                        variant,
+                        var_info.fields.len(),
+                        args.len()
+                    )));
+                }
+                // 泛型枚举：按字段实参推断类型参数；若无法推断则尝试涡轮鱼
+                let generics = self
+                    .struct_generics
+                    .get(def_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut targs: Vec<Option<HirType>> = generics.iter().map(|_| None).collect();
+                let mut typed_args = Vec::with_capacity(args.len());
+                for (_i, (arg, (_, _, fty))) in args.iter().zip(var_info.fields.iter()).enumerate()
+                {
+                    let ta = self.check_expr(arg);
+                    // 用 unify_ty 来推断 Var 占位符
+                    self.unify_ty(fty, &ta.ty, &generics, &mut targs);
+                    typed_args.push(ta);
+                }
+                // 尝试从 variant_expected_type 推断未填充的类型参数
+                for (i, t) in targs.iter_mut().enumerate() {
+                    if t.is_some() {
+                        continue;
+                    }
+                    if let Some(HirType::Enum(_, expected_targs, _)) = &self.variant_expected_type {
+                        if let Some(et) = expected_targs.get(i) {
+                            *t = Some(et.clone());
+                        }
+                    }
+                }
+                // 将推断结果转为具体实参列表
+                let concrete_targs: Vec<HirType> = targs
+                    .into_iter()
+                    .map(|o| {
+                        o.unwrap_or_else(|| {
+                            fatal(MplangError::type_error(format!(
+                                "无法推断枚举 `{}` 的泛型参数",
+                                self.name_of(def_id)
+                            )))
+                        })
+                    })
+                    .collect();
+                crate::tyhir::TyHirExpr {
+                    ty: HirType::Enum(*def_id, concrete_targs, Vec::new()),
+                    kind: crate::tyhir::TyHirExprKind::Variant {
+                        def_id: *def_id,
+                        variant: variant.clone(),
+                        args: typed_args,
+                        turbofish: turbofish.clone(),
+                    },
+                }
+            }
+
+            hir::HirExpr::Match { scrutinee, arms } => {
+                let scrutinee_ty = self.check_expr(scrutinee);
+                let match_ty = match &scrutinee_ty.ty {
+                    HirType::Enum(enum_def, targs, cargs) => {
+                        self.check_enum_match(&scrutinee_ty, enum_def, targs, cargs, arms)
+                    }
+                    HirType::Int => self.check_int_match(&scrutinee_ty, arms),
+                    other => fatal(MplangError::type_error(format!(
+                        "match 表达式需要枚举或 int 类型的被匹配值，实际为 {:?}",
+                        other
+                    ))),
+                };
+                crate::tyhir::TyHirExpr {
+                    ty: match_ty,
+                    kind: crate::tyhir::TyHirExprKind::Match {
+                        scrutinee: Box::new(scrutinee_ty),
+                        arms: self.typed_arms.take().unwrap(),
+                    },
+                }
+            }
+        }
+    }
+
+    // ───────────────── match 表达式类型检查 ─────────────────
+
+    /// 对枚举类型的 scrutinee 进行 match 类型检查。返回 match 表达式的结果类型。
+    fn check_enum_match(
+        &mut self,
+        _scrutinee_ty: &crate::tyhir::TyHirExpr,
+        enum_def: &DefId,
+        targs: &[HirType],
+        cargs: &[ConstArg],
+        arms: &[hir::HirMatchArm],
+    ) -> HirType {
+        let infos = self
+            .enum_variants
+            .get(enum_def)
+            .cloned()
+            .unwrap_or_else(|| {
+                fatal(MplangError::type_error(format!(
+                    "未定义的枚举 `{}`",
+                    self.name_of(enum_def)
+                )))
+            });
+        let generics = self
+            .struct_generics
+            .get(enum_def)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut covered_variants: Vec<String> = Vec::new();
+        let mut result_ty: Option<HirType> = None;
+        let mut typed_arms = Vec::with_capacity(arms.len());
+        let unit_ret = HirType::Unit;
+
+        for arm in arms {
+            let saved_def_types: HashMap<DefId, HirType> = self.def_types.clone();
+
+            match &arm.pattern {
+                hir::HirPattern::Wildcard | hir::HirPattern::Ident(_) => {}
+                hir::HirPattern::Variant {
+                    enum_def: arm_enum_def,
+                    variant,
+                    bindings,
+                } => {
+                    if arm_enum_def != enum_def {
+                        fatal(MplangError::type_error(format!(
+                            "match 分支的变体 `{}` 不属于枚举 `{}`",
+                            variant,
+                            self.name_of(enum_def)
+                        )));
+                    }
+                    let var_info = infos
+                        .iter()
+                        .find(|v| v.name == *variant)
+                        .unwrap_or_else(|| {
+                            fatal(MplangError::type_error(format!(
+                                "枚举 `{}` 没有变体 `{}`",
+                                self.name_of(enum_def),
+                                variant
+                            )))
+                        });
+                    if bindings.len() != var_info.fields.len() {
+                        fatal(MplangError::type_error(format!(
+                            "变体 `{}` 需要 {} 个绑定，实际给了 {}",
+                            variant,
+                            var_info.fields.len(),
+                            bindings.len()
+                        )));
+                    }
+                    for ((bdef, _bty), (_fname, _fdef, fty)) in
+                        bindings.iter().zip(var_info.fields.iter())
+                    {
+                        let field_ty = Self::subst_type(fty, &generics, targs, cargs);
+                        self.def_types.insert(*bdef, field_ty);
+                    }
+                    covered_variants.push(variant.clone());
+                }
+                hir::HirPattern::Literal(_) => {
+                    fatal(MplangError::type_error("枚举 match 中不能使用字面量模式"))
+                }
+            }
+
+            let arm_body = self.check_body(&arm.body, &unit_ret);
+            let arm_result_ty = arm_body
+                .stmts
+                .last()
+                .map(|s| self.stmt_result_ty(s))
+                .unwrap_or(HirType::Unit);
+
+            match &result_ty {
+                Some(expected) => {
+                    self.assert_ty(&arm_result_ty, expected, "match 各分支结果类型必须一致");
+                }
+                None => {
+                    result_ty = Some(arm_result_ty);
+                }
+            }
+
+            self.def_types = saved_def_types;
+
+            typed_arms.push(crate::tyhir::TyHirMatchArm {
+                pattern: self.lower_pattern_to_tyhir(&arm.pattern),
+                body: arm_body,
+            });
+        }
+
+        let has_catch_all = arms.iter().any(|a| {
+            matches!(
+                a.pattern,
+                hir::HirPattern::Wildcard | hir::HirPattern::Ident(_)
+            )
+        });
+        if !has_catch_all {
+            for v in &infos {
+                if !covered_variants.contains(&v.name) {
+                    fatal(MplangError::type_error(format!(
+                        "match 表达式未覆盖枚举 `{}` 的变体 `{}`",
+                        self.name_of(enum_def),
+                        v.name
+                    )));
+                }
+            }
+        }
+
+        self.typed_arms = Some(typed_arms);
+        result_ty.unwrap_or(HirType::Unit)
+    }
+
+    /// 对 int 类型的 scrutinee 进行 match 类型检查。
+    fn check_int_match(
+        &mut self,
+        scrutinee_ty: &crate::tyhir::TyHirExpr,
+        arms: &[hir::HirMatchArm],
+    ) -> HirType {
+        let mut result_ty: Option<HirType> = None;
+        let mut typed_arms = Vec::with_capacity(arms.len());
+        let unit_ret = HirType::Unit;
+        let _ = scrutinee_ty;
+
+        for arm in arms {
+            let saved_def_types: HashMap<DefId, HirType> = self.def_types.clone();
+
+            match &arm.pattern {
+                hir::HirPattern::Literal(_) => {}
+                hir::HirPattern::Wildcard => {}
+                hir::HirPattern::Ident(bdef) => {
+                    self.def_types.insert(*bdef, HirType::Int);
+                }
+                hir::HirPattern::Variant { .. } => {
+                    fatal(MplangError::type_error("int 类型 match 中不能使用变体模式"))
+                }
+            }
+
+            let arm_body = self.check_body(&arm.body, &unit_ret);
+            let arm_result_ty = arm_body
+                .stmts
+                .last()
+                .map(|s| self.stmt_result_ty(s))
+                .unwrap_or(HirType::Unit);
+
+            match &result_ty {
+                Some(expected) => {
+                    self.assert_ty(&arm_result_ty, expected, "match 各分支结果类型必须一致");
+                }
+                None => {
+                    result_ty = Some(arm_result_ty);
+                }
+            }
+
+            self.def_types = saved_def_types;
+
+            typed_arms.push(crate::tyhir::TyHirMatchArm {
+                pattern: self.lower_pattern_to_tyhir(&arm.pattern),
+                body: arm_body,
+            });
+        }
+
+        let has_catch_all = arms.iter().any(|a| {
+            matches!(
+                a.pattern,
+                hir::HirPattern::Wildcard | hir::HirPattern::Ident(_)
+            )
+        });
+        if !has_catch_all {
+            fatal(MplangError::type_error(
+                "int 类型 match 表达式必须包含通配符 `_` 或标识符分支",
+            ));
+        }
+
+        self.typed_arms = Some(typed_arms);
+        result_ty.unwrap_or(HirType::Unit)
+    }
+
+    /// 从 HirPattern 转换为 TyHirPattern（直接克隆，二者结构相同）。
+    fn lower_pattern_to_tyhir(&self, pattern: &hir::HirPattern) -> crate::tyhir::TyHirPattern {
+        match pattern {
+            hir::HirPattern::Variant {
+                enum_def,
+                variant,
+                bindings,
+            } => crate::tyhir::TyHirPattern::Variant {
+                enum_def: *enum_def,
+                variant: variant.clone(),
+                bindings: bindings.clone(),
+            },
+            hir::HirPattern::Literal(l) => crate::tyhir::TyHirPattern::Literal(l.clone()),
+            hir::HirPattern::Wildcard => crate::tyhir::TyHirPattern::Wildcard,
+            hir::HirPattern::Ident(d) => crate::tyhir::TyHirPattern::Ident(*d),
+        }
+    }
+
+    /// 取语句的「结果类型」——如果是 Expr 语句，取其表达式的类型；否则为 Unit。
+    fn stmt_result_ty(&self, stmt: &crate::tyhir::TyHirStmt) -> HirType {
+        match stmt {
+            crate::tyhir::TyHirStmt::Expr(e) => e.ty.clone(),
+            _ => HirType::Unit,
         }
     }
 
@@ -811,6 +1267,8 @@ impl TypeChecker {
             hir::HirExpr::Index { array, .. } => self.is_lvalue(array),
             hir::HirExpr::AddressOf(_) => true,
             hir::HirExpr::Deref(_) => true,
+            hir::HirExpr::Variant { .. } => false,
+            hir::HirExpr::Match { .. } => false,
             _ => false,
         }
     }
@@ -821,6 +1279,19 @@ impl TypeChecker {
         self.struct_fields
             .get(&struct_def)
             .and_then(|fs| fs.iter().find(|f| f.name == field))
+    }
+
+    /// 根据变体构造器 DefId 查找所属的枚举 DefId 与变体名。
+    fn find_variant_by_def_id(&self, def_id: DefId) -> Option<(DefId, String)> {
+        let name = self.names.get(&def_id)?;
+        for (enum_def, variants) in &self.enum_variants {
+            for v in variants {
+                if v.name == *name {
+                    return Some((*enum_def, v.name.clone()));
+                }
+            }
+        }
+        None
     }
 
     fn name_of(&self, def_id: &DefId) -> String {

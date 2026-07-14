@@ -3,8 +3,27 @@
 // 这里提供数值工具、泛型算法、内存与字符串的 libc 薄封装，以及打印辅助。
 // 本 crate 不依赖堆，可独立被 `extern crate core;` 引入使用。
 //
-// 注意：MPLang 没有 enum，故不提供 Rust 式的 `Option` / `Result` 类型；
-// 需要「可能为空」的值时，请用裸指针（NULL 约定为 0）或额外的标志位表达。
+// 注意：MPLang 现在支持 enum 与 match，故提供 Rust 式的 `Option` / `Result` 类型。
+
+// ───────────────── Option / Result 枚举 ─────────────────
+
+enum Option<T> { None, Some(value: T) }
+
+enum Result<T, E> { Ok(value: T), Err(error: E) }
+
+fn option_is_some<T>(o: Option<T>) -> int {
+    return match(o) {
+        None => { 0; },
+        Some(v) => { 1; },
+    };
+}
+
+fn result_is_ok<T, E>(r: Result<T, E>) -> int {
+    return match(r) {
+        Ok(v) => { 1; },
+        Err(e) => { 0; },
+    };
+}
 
 // ───────────────── 打印辅助（供 alloc / std 复用） ─────────────────
 

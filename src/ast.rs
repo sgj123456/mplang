@@ -66,6 +66,9 @@ pub enum Type {
     /// 泛型应用类型，如 `List<T>` / `Pair<int, 3>`：路径 + 实参列表。
     /// `lowering` 阶段解析路径为结构体定义，并把实参映射为类型 / 常量参数。
     Applied(Path, Vec<TypeOrConst>),
+    /// 枚举（ADT）类型引用，如 `Option<T>`。语法上与 `Applied` 同形，
+    /// `lowering` 阶段按名字查表区分是 struct 还是 enum。
+    Enum(Path, Vec<TypeOrConst>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -209,6 +212,15 @@ pub enum TopLevelDecl {
         fields: Vec<(String, Type)>,
     },
 
+    /// 代数数据类型（ADT）枚举声明：`enum Name<T> { VariantA, VariantB(T), ... }`。
+    /// 变体可携带命名字段（载荷）；无字段的变体即「单元变体」。
+    Enum {
+        attributes: Vec<Meta>,
+        name: String,
+        generics: Vec<GenericParam>,
+        variants: Vec<EnumVariant>,
+    },
+
     /// `impl <类型> { ... }`：为某类型添加方法（每个方法都是普通函数，
     /// 第一个（隐式）参数 `self` 是接收者，类型即该 `impl` 的类型）。
     Impl {
@@ -310,6 +322,40 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+
+    /// 模式匹配表达式 `match scrutinee { pat => body, ... }`。
+    /// 作为表达式使用（也可经 `Stmt::Expr` 充当语句）。
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
+}
+
+/// `match` 的一个分支：`pattern => { body }`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    /// 分支体（与 `if`/`while` 的 then_branch 一致，是语句序列）。
+    pub body: Vec<Stmt>,
+}
+
+/// `match` 的模式。变体模式从 `Expr::Call`（如 `Some(x)`）在 lowering 阶段识别；
+/// 通配 `_` 由解析器按标识符字面量 `"_"` 识别。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pattern {
+    /// 变体模式：`Some(v)` / `None`。`enum_def` 为枚举路径；`variant` 为变体名；
+    /// `bindings` 为绑定名（可带可选类型标注）。
+    Variant {
+        enum_def: Path,
+        variant: String,
+        bindings: Vec<(String, Option<Type>)>,
+    },
+    /// 字面量模式：`1` / `"x"`（仅 int / 字符串字面量可作模式）。
+    Literal(Literal),
+    /// 通配模式 `_`。
+    Wildcard,
+    /// 裸标识符模式（绑定整个 scrutinee 值），如 `x => ...`。
+    Ident(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,6 +385,14 @@ pub struct TraitMethod {
     pub params: Vec<Param>,
     pub return_ty: Type,
     pub default_body: Option<Vec<Stmt>>,
+}
+
+/// 枚举的一个变体：`None` / `Some(T)` / `Point(x:int, y:int)`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumVariant {
+    pub name: String,
+    /// 变体载荷字段。`Vec::new()` 表示单元变体（无载荷）。
+    pub fields: Vec<(String, Type)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -3,15 +3,8 @@
 //   * 带换行的打印：`println_int` / `println_str`（其余打印见下方对 core 的重新导出）；
 //   * 失败处理：`unreachable` / `abort`；
 //   * 基于 libc `FILE*` 的文件 I/O：`file_open` / `file_write_line` / `file_read_line`
-//     / `file_close`。
-//
-// 受 MPLang 能力限制（无 enum、无指针下标、无 cast、无 NULL 字面量）：
-//   * 文件句柄以 `*char`（即 C 的 `FILE*`）表示；
-//   * 读取以「调用方提供缓冲」的 `file_read_line` 形式给出，规避「堆上可变长缓冲
-//     无法按元素索引」的限制；
-//   * 不显式判空（整型 0 与指针不可比较），改用「读取返回 0 个字符」作为失败信号；
-//   * 名称在整份编译单元（所有 crate）中必须唯一，故 core / alloc 已定义的
-//     `print_int` / `printf` 等此处只「重新导出」（`use`），不再重复定义。
+//     / `file_close`，以及返回 `Option` 的 `file_read_line_opt`；
+//   * 演示用 `Allocator` trait 与 trait 对象。
 //
 // 路径说明：这里不写 `#[path]`。编译器在解析 `extern crate` 时会从顶层输入目录
 // 向上逐级寻找 `<祖先>/library/<name>.mp`，因此 `std` 被任意目录的程序引入时
@@ -82,6 +75,44 @@ fn file_write_line(f: *char, s: *char) -> int {
 fn file_read_line(f: *char, buf: *char, max: int) -> int {
     libc_fgets(buf, max, f);
     return strlen(buf);
+}
+
+// 返回 `Option` 的读取。成功时 `Some(buf)`；无内容或错误时 `None`。
+fn file_read_line_opt(f: *char, buf: *char, max: int) -> Option<*char> {
+    libc_fgets(buf, max, f);
+    let n: int = strlen(buf);
+    if (n == 0) {
+        let r: Option<*char> = None;
+        return r;
+    }
+    return Some(buf);
+}
+
+// ───────────────── 演示：Allocator trait 与 trait 对象 ─────────────────
+
+#[link_name = "malloc"] extern fn malloc_char(size: int) -> *char;
+#[link_name = "free"]   extern fn free_char(ptr: *char) -> int;
+
+trait Allocator {
+    fn alloc(size: int) -> *char;
+    fn dealloc(p: *char) -> int;
+}
+
+struct SysAllocator {}
+
+impl Allocator for SysAllocator {
+    fn alloc(size: int) -> *char {
+        return malloc_char(size);
+    }
+    fn dealloc(p: *char) -> int {
+        return free_char(p);
+    }
+}
+
+// 通过 trait 对象调用分配器（演示动态分发）。
+// 注意：v1 简化下动态方法调用的返回类型固定为 Int，故返回 int 而非 *char。
+fn alloc_with(a: *Allocator, size: int) -> int {
+    return a.alloc(size);
 }
 
 // ───────────────── 重新导出 core / alloc 的既有能力 ─────────────────
