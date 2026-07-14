@@ -36,6 +36,12 @@ pub struct Lowerer {
     /// 全限定路径 → 定义 ID（顶层 + 模块限定）。
     path_to_def: HashMap<SymbolPath, DefId>,
 
+    /// 最后一段名字 → 定义 ID（平铺索引）。
+    /// 用于「按最后一段名字回退」：当 `Point` 在 `path_to_def` 中以 `[模块, Point]`
+    /// 登记时，单段 `Point` 也能通过此索引解析到对应 DefId。冲突时保留最后插入者
+    /// （与现有多段回退的语义一致，且本语言无跨模块裸名作用域，故可接受）。
+    last_seg_index: HashMap<String, DefId>,
+
     /// 当前正在降低的泛型定义（函数 / 结构体 / impl 方法）的泛型参数列表。
     /// 用于 `lower_type` 把裸类型参数名解析为 [`HirType::Var`] / [`HirType::Generic`]，
     /// 并把常量参数名解析为数组长度的常量下标。不处于泛型上下文时为空。
@@ -73,6 +79,7 @@ impl Lowerer {
         Lowerer {
             next_id: 0,
             path_to_def: HashMap::new(),
+            last_seg_index: HashMap::new(),
             aliases: HashMap::new(),
             loaded_set: HashSet::new(),
             loaded_cache: HashMap::new(),
@@ -85,6 +92,16 @@ impl Lowerer {
     fn alloc(&mut self) -> DefId {
         let id = DefId(self.next_id);
         self.next_id += 1;
+        id
+    }
+
+    /// 登记一个定义：同时写入全限定路径表与「最后一段名字」平铺索引。
+    fn register_def(&mut self, prefix: &[String], name: &str) -> DefId {
+        let id = self.alloc();
+        let mut segs = prefix.to_vec();
+        segs.push(name.to_string());
+        self.path_to_def.insert(self.sym(&segs), id);
+        self.last_seg_index.insert(name.to_string(), id);
         id
     }
 
@@ -127,10 +144,8 @@ impl Lowerer {
         for decl in decls {
             match decl {
                 TopLevelDecl::ModDecl { name, .. } => {
-                    let id = self.alloc();
-                    let mut segs = prefix.to_vec();
-                    segs.push(name.clone());
-                    self.path_to_def.insert(self.sym(&segs), id);
+                    let id = self.register_def(prefix, name);
+                    let _ = id;
 
                     if let Some(sub) = self.get_module(name) {
                         let mut sub_prefix = prefix.to_vec();
@@ -141,10 +156,8 @@ impl Lowerer {
                 TopLevelDecl::ExternCrate {
                     name, attributes, ..
                 } => {
-                    let id = self.alloc();
-                    let mut segs = prefix.to_vec();
-                    segs.push(name.clone());
-                    self.path_to_def.insert(self.sym(&segs), id);
+                    let id = self.register_def(prefix, name);
+                    let _ = id;
 
                     // 加载外部 crate 源文件（路径可由 `#[path = "..."]` 指定），
                     // 并把其中的定义登记到 `[name, ...]` 前缀下，使 `use name::item`
@@ -163,18 +176,12 @@ impl Lowerer {
                 | TopLevelDecl::StructDef { name, .. }
                 | TopLevelDecl::Static { name, .. }
                 | TopLevelDecl::Const { name, .. } => {
-                    let id = self.alloc();
-                    let mut segs = prefix.to_vec();
-                    segs.push(name.clone());
-                    self.path_to_def.insert(self.sym(&segs), id);
+                    self.register_def(prefix, name);
                 }
                 TopLevelDecl::Trait { name, methods, .. } => {
                     // trait 仅作编译期契约：登记其方法签名表（按裸名索引），
                     // 并为 trait 自身分配一个 DefId（供 `impl Trait for` 名字解析）。
-                    let id = self.alloc();
-                    let mut segs = prefix.to_vec();
-                    segs.push(name.clone());
-                    self.path_to_def.insert(self.sym(&segs), id);
+                    self.register_def(prefix, name);
                     let infos = methods
                         .iter()
                         .map(|m| TraitMethodInfo {
@@ -834,13 +841,12 @@ impl Lowerer {
             return *d;
         }
 
-        // 3. 仅按最后一段名字回退（平铺定义，如 `add`）。
-        if segs.len() > 1 {
-            let last = segs.last().unwrap().clone();
-            let sp2 = self.sym(&[last]);
-            if let Some(d) = self.path_to_def.get(&sp2) {
-                return *d;
-            }
+        // 3. 按最后一段名字回退（平铺定义，如 `add`，或子模块内定义的 `Point`）。
+        //    `path_to_def` 以全限定路径为键，故单段 `Point` 需经「最后一段名字」索引
+        //    才能命中 `[模块, Point]`。根模块下的单段名已由第 2 步精确命中，不受影响。
+        let last = segs.last().unwrap().clone();
+        if let Some(d) = self.last_seg_index.get(&last) {
+            return *d;
         }
 
         crate::error::fatal(MplangError::lowering(format!(

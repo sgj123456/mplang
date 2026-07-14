@@ -184,11 +184,19 @@ impl Lexer {
                 }
             }
             '"' => {
-                self.advance();
+                // `next_token` 已通过 `let ch = self.advance()` 越过开头的 `"`，
+                // 因此这里无需再 advance；直接从内容（或紧跟的结尾 `"`）开始扫描。
                 while !self.is_at_end() && self.current_char() != '"' {
                     self.advance();
                 }
-                self.advance();
+                if self.is_at_end() {
+                    return Err(MplangError::lex(format!(
+                        "未闭合的字符串字面量（第 {} 行，第 {} 列）",
+                        start_line, start_col
+                    ))
+                    .with_span(start_line, start_col));
+                }
+                self.advance(); // 越过结尾的 `"`
                 let lexeme: String = self.raw[start_pos..self.current].iter().collect();
                 self.make_token(TokenKind::StringLiteral, lexeme, start_line, start_col)
             }
@@ -334,5 +342,26 @@ mod tests {
         assert_eq!(toks[3].kind, TokenKind::Assign);
         assert_eq!(toks[4].kind, TokenKind::StringLiteral);
         assert_eq!(toks[5].kind, TokenKind::RightBracket);
+    }
+
+    #[test]
+    fn lex_empty_string_literal() {
+        // 空字符串 `""` 曾因 lexer 重复 advance 越过闭合引号而扫描到 EOF（panic）
+        // 或错误吞掉后续引号。验证其被正确识别为单个空字符串字面量。
+        let toks = lex("let s = \"\";");
+        assert_eq!(toks[2].kind, TokenKind::Assign);
+        assert_eq!(toks[3].kind, TokenKind::StringLiteral);
+        assert_eq!(toks[3].lexeme, "\"\"");
+        assert_eq!(toks[4].kind, TokenKind::Semicolon);
+    }
+
+    #[test]
+    fn lex_unterminated_string_is_error() {
+        // 未闭合的字符串应作为词法错误返回，而非越界 panic 或吞掉后续内容。
+        let err = Lexer::new("let s = \"abc".chars().collect())
+            .lex()
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Lex);
+        assert!(err.message.contains("未闭合"));
     }
 }
