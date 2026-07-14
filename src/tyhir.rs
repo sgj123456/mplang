@@ -14,8 +14,8 @@
 //! 换言之，TYPE HIR = HIR + 类型标注 + 字段解析结果。它是「信任边界」：
 //! 经过 TyHIR 后的程序保证类型良好，后端只需照着它生成机器码即可。
 
-use crate::ast::{BinOp, Literal, Meta};
-use crate::hir::{DefId, HirType, TypeOrConst, Visibility};
+use crate::ast::{BinOp, GenericParam, Literal, Meta};
+use crate::hir::{DefId, HirType, ParamKind, TypeOrConst, Visibility};
 
 /// 整个程序的 TyHIR 根。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +54,9 @@ pub enum TyHirItem {
         visibility: Visibility,
         attributes: Vec<Meta>,
         name: String,
+        /// 泛型参数声明（类型参数 / 常量参数）。单态化阶段据其生成具体实例；
+        /// 非泛型函数为空。后端不使用此字段。
+        generics: Vec<GenericParam>,
         params: Vec<TyHirParam>,
         return_ty: HirType,
         body: TyHirBody,
@@ -66,6 +69,9 @@ pub enum TyHirItem {
         visibility: Visibility,
         attributes: Vec<Meta>,
         name: String,
+        /// 泛型参数声明（类型参数 / 常量参数）。单态化阶段据其生成具体实例；
+        /// 非泛型结构体为空。后端不使用此字段。
+        generics: Vec<GenericParam>,
         fields: Vec<TyHirField>,
     },
 
@@ -85,6 +91,9 @@ pub struct TyHirParam {
     pub def_id: DefId,
     pub name: String,
     pub ty: HirType,
+    /// 参数种类（值 / 类型参数 / 常量参数）。单态化据此识别常量参数，
+    /// 实例化后常量参数退化为整型字面量。后端不使用此字段。
+    pub kind: ParamKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -77,8 +77,9 @@ impl Parser {
             .clone();
         let mut segments = vec![first];
 
-        // 连续匹配 ::ident
-        while self.check(&TokenKind::ColonColon) {
+        // 连续匹配 ::ident。但 `::<...>` 是涡轮鱼（泛型实参），不应在此消费，
+        // 留给调用点 / 结构体字面量解析处的 `parse_turbofish` 处理。
+        while self.check(&TokenKind::ColonColon) && !self.check_next(&TokenKind::Less) {
             self.advance(); // consume ::
             let seg = self
                 .consume(TokenKind::Ident, "Expected identifier after '::'")

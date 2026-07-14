@@ -25,6 +25,27 @@ pub enum Visibility {
     Private,
 }
 
+/// 常量泛型实参：整数字面量，或某个常量泛型参数的下标（在单态化时按实例化实参映射为具体整数）。
+///
+/// 例如 `make_pair<T, const N: int>() -> Pair<T, N>` 的返回类型里，`N` 被记为 [`ConstArg::Param`]
+/// （下标指 `make_pair` 自身的第 1 号常量参数）；单态化 `make_pair<int, 2>` 时该 `Param` 被解算为
+/// [`ConstArg::Literal`]`(2)`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConstArg {
+    Literal(i64),
+    Param(usize),
+}
+
+impl ConstArg {
+    /// 把一个常量实参转换为数组长度：整数字面量 → 已知长度；常量参数引用 → 仍记为参数下标。
+    pub fn as_array_len(self, param_idx: usize) -> ArrayLen {
+        match self {
+            ConstArg::Literal(v) => ArrayLen::Known(v as usize),
+            ConstArg::Param(_) => ArrayLen::Const(param_idx),
+        }
+    }
+}
+
 /// 数组长度：编译期已知长度，或某个常量泛型参数的下标（单态化时映射为具体整数）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArrayLen {
@@ -72,8 +93,9 @@ pub enum HirType {
     /// 仅存在于泛型「模板」之中，单态化时被替换为具体类型。
     Var(usize),
     /// 泛型应用类型：路径（已解析为结构体 [`DefId`]）加上类型实参与常量实参。
-    /// 例如 `List<T>` / `Pair<int, 3>`。单态化后变为对应的实例化结构体 [`Named`]。
-    Generic(DefId, Vec<HirType>, Vec<i64>),
+    /// 例如 `List<T>` / `Pair<int, 3>`。常量实参可为 [`ConstArg::Param`]（引用外层常量参数）
+    /// 或 [`ConstArg::Literal`]（具体整数），单态化后 `Param` 被解算为 `Literal` 并最终变为 [`Named`]。
+    Generic(DefId, Vec<HirType>, Vec<ConstArg>),
 }
 
 /// 函数 / 方法参数种类。用于区分「值参数」「类型参数」「常量参数」，
@@ -86,11 +108,14 @@ pub enum ParamKind {
     ConstParam(usize),
 }
 
-/// 涡轮鱼 / 显式泛型实参（HIR 层）：类型实参或整型常量实参。
+/// 涡轮鱼 / 显式泛型实参（HIR 层）：类型实参、整型常量实参，或常量参数名引用。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeOrConst {
     Type(HirType),
     Const(i64),
+    /// 常量参数名引用（如 `Pair::<T, N>` 中的 `N`），`usize` 为该常量参数在「全部泛型参数」中的下标。
+    /// 单态化时按实例化实参解算为具体整数。
+    ConstParam(usize),
 }
 
 impl HirType {

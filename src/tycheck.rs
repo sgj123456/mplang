@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use crate::ast::{BinOp, GenericParam, GenericParamKind, Literal};
 use crate::error::{MplangError, fatal, into_result};
-use crate::hir::{self, ArrayLen, DefId, HirType, ParamKind, TypeOrConst};
+use crate::hir::{self, ArrayLen, ConstArg, DefId, HirType, ParamKind, TypeOrConst};
 
 /// 结构体字段信息（用于按字段名解析出字段 [`DefId`]）。
 #[derive(Clone)]
@@ -31,9 +31,11 @@ struct StructFieldInfo {
     ty: HirType,
 }
 
-/// 函数签名信息（用于调用校验）。
+/// 函数签名信息（用于调用校验）。`generics` 为空表示非泛型函数；否则 `param_types` /
+/// `ret_ty` 中可能含有 [`HirType::Var`]（类型参数占位符），调用时需代入具体实参。
 #[derive(Clone)]
 struct FuncSig {
+    generics: Vec<GenericParam>,
     param_types: Vec<HirType>,
     ret_ty: HirType,
     is_variadic: bool,
@@ -51,6 +53,8 @@ pub struct TypeChecker {
     struct_generics: HashMap<DefId, Vec<GenericParam>>,
     /// 函数定义 ID → 签名。
     func_sigs: HashMap<DefId, FuncSig>,
+    /// 函数定义 ID → 泛型参数声明（非泛型函数为空）。
+    fn_generics: HashMap<DefId, Vec<GenericParam>>,
     /// 方法表：(接收者类型, 方法名) → 方法定义 ID。
     method_table: HashMap<MethodKey, DefId>,
     /// 所有「值」定义（参数 / let / 全局变量）的 ID → 类型。
@@ -66,6 +70,7 @@ impl TypeChecker {
             struct_fields: HashMap::new(),
             struct_generics: HashMap::new(),
             func_sigs: HashMap::new(),
+            fn_generics: HashMap::new(),
             method_table: HashMap::new(),
             def_types: HashMap::new(),
             names: HashMap::new(),
@@ -116,6 +121,7 @@ impl TypeChecker {
                 self.func_sigs.insert(
                     *def_id,
                     FuncSig {
+                        generics: Vec::new(),
                         param_types: param_types.clone(),
                         ret_ty: return_ty.clone(),
                         is_variadic: *is_variadic,
@@ -125,12 +131,14 @@ impl TypeChecker {
             hir::HirItem::Fn {
                 def_id,
                 name,
+                generics,
                 params,
                 return_ty,
                 impl_receiver,
                 ..
             } => {
                 self.names.insert(*def_id, name.clone());
+                self.fn_generics.insert(*def_id, generics.clone());
                 // 函数签名只统计「值参数」：类型参数 / 常量参数不是调用方提供的实参，
                 // 其（实参）来自涡轮鱼或在被调用处的类型上下文里推断。
                 let param_types: Vec<HirType> = params
@@ -141,6 +149,7 @@ impl TypeChecker {
                 self.func_sigs.insert(
                     *def_id,
                     FuncSig {
+                        generics: generics.clone(),
                         param_types,
                         ret_ty: return_ty.clone(),
                         is_variadic: false,
@@ -226,6 +235,7 @@ impl TypeChecker {
                 visibility,
                 attributes,
                 name,
+                generics,
                 params,
                 return_ty,
                 body,
@@ -243,12 +253,14 @@ impl TypeChecker {
                     visibility: visibility.clone(),
                     attributes: attributes.clone(),
                     name: name.clone(),
+                    generics: generics.clone(),
                     params: params
                         .iter()
                         .map(|p| crate::tyhir::TyHirParam {
                             def_id: p.def_id,
                             name: p.name.clone(),
                             ty: p.ty.clone(),
+                            kind: p.kind,
                         })
                         .collect(),
                     return_ty: return_ty.clone(),
@@ -262,6 +274,7 @@ impl TypeChecker {
                 visibility,
                 attributes,
                 name,
+                generics,
                 fields,
                 ..
             } => crate::tyhir::TyHirItem::Struct {
@@ -269,6 +282,7 @@ impl TypeChecker {
                 visibility: visibility.clone(),
                 attributes: attributes.clone(),
                 name: name.clone(),
+                generics: generics.clone(),
                 fields: fields
                     .iter()
                     .map(|f| crate::tyhir::TyHirField {
@@ -548,17 +562,47 @@ impl TypeChecker {
                     )));
                 }
 
-                let mut typed_args = Vec::with_capacity(args.len());
-                for (i, arg) in args.iter().enumerate() {
-                    let te = self.check_expr(arg);
-                    if i < sig.param_types.len() {
-                        self.assert_ty(
-                            &te.ty,
-                            &sig.param_types[i],
-                            &format!("函数 `{}` 第 {} 个参数", self.name_of(callee), i),
-                        );
+                // 先逐个检查实参，得到带类型的实参列表；再统一代入泛型形参 / 返回类型。
+                let typed_args: Vec<crate::tyhir::TyHirExpr> =
+                    args.iter().map(|a| self.check_expr(a)).collect();
+
+                // 泛型函数：把 `param_types` / `ret_ty` 中的 `Var` 占位符按实参代入（拒绝鸭子类型）。
+                if sig.generics.is_empty() {
+                    for (i, te) in typed_args.iter().enumerate() {
+                        if i < sig.param_types.len() {
+                            self.assert_ty(
+                                &te.ty,
+                                &sig.param_types[i],
+                                &format!("函数 `{}` 第 {} 个参数", self.name_of(callee), i),
+                            );
+                        }
                     }
-                    typed_args.push(te);
+                } else {
+                    let (subst_params, subst_ret) = self.instantiate_fn_sig(
+                        &sig.generics,
+                        &sig.param_types,
+                        &sig.ret_ty,
+                        turbofish,
+                        &typed_args,
+                    );
+                    for (i, te) in typed_args.iter().enumerate() {
+                        if i < subst_params.len() {
+                            self.assert_ty(
+                                &te.ty,
+                                &subst_params[i],
+                                &format!("函数 `{}` 第 {} 个参数", self.name_of(callee), i),
+                            );
+                        }
+                    }
+                    let call_ty = subst_ret;
+                    return crate::tyhir::TyHirExpr {
+                        ty: call_ty,
+                        kind: crate::tyhir::TyHirExprKind::Call {
+                            callee: *callee,
+                            args: typed_args,
+                            turbofish: turbofish.clone(),
+                        },
+                    };
                 }
 
                 crate::tyhir::TyHirExpr {
@@ -798,11 +842,12 @@ impl TypeChecker {
     /// 用一个泛型参数声明表与「具体实参」代入类型。`type_args`/`const_args` 分别按
     /// 类型参数 / 常量参数的出现顺序存放（与 [`HirType::Generic`] 的存储一致）。
     /// `Var(i)` 中的 `i` 是「全部泛型参数」里的下标，需先映射到类型参数序列里的位置再取实参。
-    fn subst_type(
+    /// 以关联函数形式提供（无 `self`），供单态化趟通过 [`TypeChecker::subst_type`] 复用。
+    pub(crate) fn subst_type(
         ty: &HirType,
         generics: &[GenericParam],
         type_args: &[HirType],
-        const_args: &[i64],
+        const_args: &[ConstArg],
     ) -> HirType {
         match ty {
             HirType::Var(i) => {
@@ -817,7 +862,11 @@ impl TypeChecker {
                 ta.iter()
                     .map(|t| Self::subst_type(t, generics, type_args, const_args))
                     .collect(),
-                ca.clone(),
+                // 常量实参中的 `Param` 引用按「外层上下文」解算：若外层已给出具体整数则化为
+                // `Literal`，否则保留为 `Param`（仍指向外层某常量参数）。不做跨层递归。
+                ca.iter()
+                    .map(|a| Self::resolve_const(a, generics, const_args))
+                    .collect(),
             ),
             HirType::Pointer(e) => HirType::Pointer(Box::new(Self::subst_type(
                 e, generics, type_args, const_args,
@@ -826,11 +875,8 @@ impl TypeChecker {
                 let nl = match l {
                     ArrayLen::Known(n) => ArrayLen::Known(*n),
                     ArrayLen::Const(i) => {
-                        let q = generics[0..*i]
-                            .iter()
-                            .filter(|g| matches!(g.kind, GenericParamKind::Const))
-                            .count();
-                        ArrayLen::Known(const_args[q] as usize)
+                        Self::resolve_const(&ConstArg::Param(*i), generics, const_args)
+                            .as_array_len(*i)
                     }
                 };
                 HirType::Array(
@@ -840,6 +886,166 @@ impl TypeChecker {
             }
             other => other.clone(),
         }
+    }
+
+    /// 把一个 [`ConstArg`] 在「外层泛型上下文」中解算一层：
+    /// - `Literal(v)` 原样返回；
+    /// - `Param(i)` 取外层 `const_args` 中对应位置的项（该项已是外层上下文的具体值或更外层的
+    ///   `Param`，不再递归到当前模板，避免 `const_args` 自身含 `Param` 时陷入死循环）。
+    fn resolve_const(
+        ca: &ConstArg,
+        generics: &[GenericParam],
+        const_args: &[ConstArg],
+    ) -> ConstArg {
+        match ca {
+            ConstArg::Literal(v) => ConstArg::Literal(*v),
+            ConstArg::Param(i) => {
+                let q = Self::const_slot(generics, *i);
+                const_args[q]
+            }
+        }
+    }
+
+    /// 类型参数 `generics[k]`（种类为 Type）在「类型实参向量」中的下标。
+    fn type_slot(generics: &[GenericParam], k: usize) -> usize {
+        generics[0..k]
+            .iter()
+            .filter(|g| matches!(g.kind, GenericParamKind::Type))
+            .count()
+    }
+
+    /// 常量参数 `generics[k]`（种类为 Const）在「常量实参向量」中的下标。
+    fn const_slot(generics: &[GenericParam], k: usize) -> usize {
+        generics[0..k]
+            .iter()
+            .filter(|g| matches!(g.kind, GenericParamKind::Const))
+            .count()
+    }
+
+    /// 把「期望类型」中的 [`HirType::Var`] 占位符按与「实际类型」的对应关系填入 `targs`。
+    /// 仅处理类型参数；具体类型不回填（由调用处的 [`assert_ty`] 负责校验）。
+    fn unify_ty(
+        &self,
+        expected: &HirType,
+        actual: &HirType,
+        generics: &[GenericParam],
+        targs: &mut [Option<HirType>],
+    ) {
+        match expected {
+            HirType::Var(j) => {
+                let slot = Self::type_slot(generics, *j);
+                if targs[slot].is_none() {
+                    targs[slot] = Some(actual.clone());
+                } else if targs[slot].as_ref() != Some(actual) {
+                    fatal(MplangError::type_error(
+                        "泛型类型参数推断冲突（同一类型参数被推导为不同的具体类型）",
+                    ));
+                }
+            }
+            HirType::Pointer(e) => {
+                if let HirType::Pointer(a) = actual {
+                    self.unify_ty(e, a, generics, targs);
+                }
+            }
+            HirType::Array(e1, _) => {
+                if let HirType::Array(e2, _) = actual {
+                    self.unify_ty(e1, e2, generics, targs);
+                }
+            }
+            HirType::Generic(d1, t1, _) => {
+                if let HirType::Generic(d2, t2, _) = actual
+                    && d1 == d2
+                {
+                    for (x, y) in t1.iter().zip(t2.iter()) {
+                        self.unify_ty(x, y, generics, targs);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 为一个泛型函数调用推断类型 / 常量实参，并把签名（`param_types` / `ret_ty`）
+    /// 中的 [`HirType::Var`] 占位符代入为具体类型，返回「已代入的形参类型」与「已代入的返回类型」。
+    /// 拒绝鸭子类型：类型参数必须能由涡轮鱼或位置实参类型唯一确定；常量参数只能由涡轮鱼提供。
+    fn instantiate_fn_sig(
+        &self,
+        generics: &[GenericParam],
+        param_types: &[HirType],
+        ret_ty: &HirType,
+        turbofish: &[TypeOrConst],
+        args: &[crate::tyhir::TyHirExpr],
+    ) -> (Vec<HirType>, HirType) {
+        let n_type = generics
+            .iter()
+            .filter(|g| matches!(g.kind, GenericParamKind::Type))
+            .count();
+        let n_const = generics
+            .iter()
+            .filter(|g| matches!(g.kind, GenericParamKind::Const))
+            .count();
+        let mut targs: Vec<Option<HirType>> = vec![None; n_type];
+        let mut cargs: Vec<Option<ConstArg>> = vec![None; n_const];
+
+        // 1) 涡轮鱼（按泛型参数声明顺序）。
+        if turbofish.len() > generics.len() {
+            fatal(MplangError::type_error(format!(
+                "泛型实参过多（期望 {} 个）",
+                generics.len()
+            )));
+        }
+        for (k, a) in turbofish.iter().enumerate() {
+            match (&generics[k].kind, a) {
+                (GenericParamKind::Type, TypeOrConst::Type(t)) => {
+                    targs[Self::type_slot(generics, k)] = Some(t.clone());
+                }
+                (GenericParamKind::Const, TypeOrConst::Const(v)) => {
+                    cargs[Self::const_slot(generics, k)] = Some(ConstArg::Literal(*v));
+                }
+                (GenericParamKind::Const, TypeOrConst::ConstParam(_)) => fatal(
+                    MplangError::type_error("常量参数名引用无法在调用处解析，请改用整数字面量"),
+                ),
+                _ => fatal(MplangError::type_error(
+                    "泛型实参种类与声明不符（类型参数需要类型，常量参数需要整型）",
+                )),
+            }
+        }
+
+        // 2) 从位置实参类型推断类型参数。
+        for (pt, arg) in param_types.iter().zip(args.iter()) {
+            self.unify_ty(pt, &arg.ty, generics, &mut targs);
+        }
+
+        // 3) 校验全部实参已就位。
+        for (i, g) in generics.iter().enumerate() {
+            match g.kind {
+                GenericParamKind::Type => {
+                    if targs[Self::type_slot(generics, i)].is_none() {
+                        fatal(MplangError::type_error(format!(
+                            "无法推断类型参数 `{}`，请用涡轮鱼 `::<...>` 显式指定",
+                            g.name
+                        )));
+                    }
+                }
+                GenericParamKind::Const => {
+                    if cargs[Self::const_slot(generics, i)].is_none() {
+                        fatal(MplangError::type_error(format!(
+                            "常量参数 `{}` 必须由涡轮鱼 `::<...>` 显式指定",
+                            g.name
+                        )));
+                    }
+                }
+            }
+        }
+
+        let tvec: Vec<HirType> = targs.into_iter().map(|o| o.unwrap()).collect();
+        let cvec: Vec<ConstArg> = cargs.into_iter().map(|o| o.unwrap()).collect();
+        let subst_params = param_types
+            .iter()
+            .map(|t| Self::subst_type(t, generics, &tvec, &cvec))
+            .collect();
+        let subst_ret = Self::subst_type(ret_ty, generics, &tvec, &cvec);
+        (subst_params, subst_ret)
     }
 
     /// 为泛型结构体字面量推断类型 / 常量实参。
@@ -853,10 +1059,18 @@ impl TypeChecker {
         turbofish: &[TypeOrConst],
         infos: &[StructFieldInfo],
         checked: &[(&str, crate::tyhir::TyHirExpr)],
-    ) -> (Vec<HirType>, Vec<i64>) {
+    ) -> (Vec<HirType>, Vec<ConstArg>) {
         let n = generics.len();
-        let mut type_args: Vec<Option<HirType>> = vec![None; n];
-        let mut const_args: Vec<Option<i64>> = vec![None; n];
+        let n_type = generics
+            .iter()
+            .filter(|g| matches!(g.kind, GenericParamKind::Type))
+            .count();
+        let n_const = generics
+            .iter()
+            .filter(|g| matches!(g.kind, GenericParamKind::Const))
+            .count();
+        let mut type_args: Vec<Option<HirType>> = vec![None; n_type];
+        let mut const_args: Vec<Option<ConstArg>> = vec![None; n_const];
 
         // 1) 涡轮鱼。
         if turbofish.len() > n {
@@ -869,10 +1083,13 @@ impl TypeChecker {
         for (ti, a) in turbofish.iter().enumerate() {
             match (&generics[ti].kind, a) {
                 (GenericParamKind::Type, TypeOrConst::Type(t)) => {
-                    type_args[ti] = Some(t.clone());
+                    type_args[Self::type_slot(generics, ti)] = Some(t.clone());
                 }
                 (GenericParamKind::Const, TypeOrConst::Const(v)) => {
-                    const_args[ti] = Some(*v);
+                    const_args[Self::const_slot(generics, ti)] = Some(ConstArg::Literal(*v));
+                }
+                (GenericParamKind::Const, TypeOrConst::ConstParam(i)) => {
+                    const_args[Self::const_slot(generics, ti)] = Some(ConstArg::Param(*i));
                 }
                 _ => fatal(MplangError::type_error(format!(
                     "结构体 `{}` 第 {} 个泛型实参与其声明种类不符",
@@ -895,7 +1112,7 @@ impl TypeChecker {
         for (i, g) in generics.iter().enumerate() {
             match g.kind {
                 GenericParamKind::Type => {
-                    if type_args[i].is_none() {
+                    if type_args[Self::type_slot(generics, i)].is_none() {
                         fatal(MplangError::type_error(format!(
                             "无法推断结构体 `{}` 的类型参数 `{}`，请用涡轮鱼显式指定",
                             self.name_of(struct_def),
@@ -904,7 +1121,7 @@ impl TypeChecker {
                     }
                 }
                 GenericParamKind::Const => {
-                    if const_args[i].is_none() {
+                    if const_args[Self::const_slot(generics, i)].is_none() {
                         fatal(MplangError::type_error(format!(
                             "结构体 `{}` 的常量参数 `{}` 必须由涡轮鱼显式指定",
                             self.name_of(struct_def),
@@ -915,7 +1132,7 @@ impl TypeChecker {
             }
         }
 
-        let targs = type_args.into_iter().map(|o| o.unwrap()).collect();
+        let targs: Vec<HirType> = type_args.into_iter().map(|o| o.unwrap()).collect();
         let cargs = const_args.into_iter().map(|o| o.unwrap()).collect();
         (targs, cargs)
     }

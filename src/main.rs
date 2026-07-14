@@ -9,7 +9,7 @@ use env_logger::Env;
 
 use mplangc::{
     ast::CompilationUnit, compiler::Compiler, error::MplangError, error::into_result, lexer::Lexer,
-    lowering::Lowerer, parser::Parser, tycheck::TypeChecker,
+    lowering::Lowerer, monomorphize::monomorphize, parser::Parser, tycheck::TypeChecker,
 };
 
 /// MPLang Compiler - 支持 AOT 编译与 JIT 即时执行
@@ -115,6 +115,10 @@ fn run() -> Result<(), MplangError> {
         println!("{:#?}", tyhir);
         return Ok(());
     }
+
+    // 3) 单态化：把泛型定义按需展开为具体实例，消除所有泛型占位符
+    //    （函数/结构体泛型、常量泛型），使后端得到完全具体的 TYPE HIR。
+    let tyhir = monomorphize(&tyhir)?;
 
     // ---------- CodeGen 分发 ----------
     // `--eval` 意为“执行一段源码”，应在内存中即时执行（JIT），不产生任何磁盘文件；

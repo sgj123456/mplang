@@ -767,8 +767,24 @@ impl Lowerer {
                 let mut cargs = Vec::new();
                 for a in args {
                     match a {
-                        crate::ast::TypeOrConst::Type(t) => targs.push(self.lower_type(t)),
-                        crate::ast::TypeOrConst::Const(v) => cargs.push(*v),
+                        crate::ast::TypeOrConst::Type(t) => {
+                            // 单段裸名若在当前泛型上下文中是某个「常量参数」，则记为对该参数的引用
+                            // （如 `Pair<T, N>` 中的 `N`），而非一个类型名。
+                            if let crate::ast::Type::Named(p) = t
+                                && p.segments.len() == 1
+                                && let Some(idx) = self.cur_generics.iter().position(|g| {
+                                    g.kind == crate::ast::GenericParamKind::Const
+                                        && g.name == p.segments[0]
+                                })
+                            {
+                                cargs.push(crate::hir::ConstArg::Param(idx));
+                            } else {
+                                targs.push(self.lower_type(t));
+                            }
+                        }
+                        crate::ast::TypeOrConst::Const(v) => {
+                            cargs.push(crate::hir::ConstArg::Literal(*v))
+                        }
                     }
                 }
                 HirType::Generic(def, targs, cargs)
@@ -777,10 +793,23 @@ impl Lowerer {
     }
 
     /// 把 AST 涡轮鱼实参列表降低为 HIR 层（`TypeOrConst` 中的类型实参经 [`lower_type`]）。
+    /// 单段裸名若在当前泛型上下文中是某个「常量参数」，则记为 [`TypeOrConst::ConstParam`]
+    /// （如 `Pair::<T, N>` 中的 `N`），而非当作类型名去解析。
     fn lower_turbofish(&mut self, tf: &[crate::ast::TypeOrConst]) -> Vec<TypeOrConst> {
         tf.iter()
             .map(|a| match a {
-                crate::ast::TypeOrConst::Type(t) => TypeOrConst::Type(self.lower_type(t)),
+                crate::ast::TypeOrConst::Type(t) => {
+                    if let crate::ast::Type::Named(p) = t
+                        && p.segments.len() == 1
+                        && let Some(idx) = self.cur_generics.iter().position(|g| {
+                            g.kind == crate::ast::GenericParamKind::Const && g.name == p.segments[0]
+                        })
+                    {
+                        TypeOrConst::ConstParam(idx)
+                    } else {
+                        TypeOrConst::Type(self.lower_type(t))
+                    }
+                }
                 crate::ast::TypeOrConst::Const(v) => TypeOrConst::Const(*v),
             })
             .collect()

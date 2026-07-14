@@ -319,11 +319,22 @@ impl Parser {
                 Expr::Literal(Literal::String(value))
             }
             TokenKind::Ident => {
-                // 结构体字面量检测：先解析完整 path，再检查是否紧跟 {
+                // 先解析完整 path，再检查是否紧跟涡轮鱼 `::<...>`。
                 let path = self.parse_path();
                 let turbofish = self.parse_turbofish();
                 if self.check(&TokenKind::LeftBrace) {
                     return self.struct_literal_with_path(path, turbofish);
+                }
+                if self.check(&TokenKind::LeftParen) {
+                    // 带涡轮鱼的函数调用：`f::<T>(args)`。
+                    self.advance();
+                    let args = self.call_argument();
+                    self.consume(TokenKind::RightParen, "Expected ')' after arguments");
+                    return Expr::Call {
+                        callee: path,
+                        args,
+                        turbofish,
+                    };
                 }
                 if !turbofish.is_empty() {
                     crate::error::fatal(MplangError::parse(

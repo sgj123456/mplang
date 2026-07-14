@@ -96,7 +96,10 @@ fn run_frontend(
     let mut lowerer = Lowerer::new(Some(path));
     let hir = lowerer.lower(unit).map_err(|e| e.to_string())?;
     let mut checker = TypeChecker::new(&hir);
-    checker.check(&hir).map_err(|e| e.to_string())
+    let tyhir = checker.check(&hir).map_err(|e| e.to_string())?;
+    // 单态化：把泛型定义按需展开为具体实例，消除所有泛型占位符
+    // （函数/结构体泛型、常量泛型），使后端得到完全具体的 TYPE HIR。
+    mplangc::monomorphize::monomorphize(&tyhir).map_err(|e| e.to_string())
 }
 
 /// 该编译单元是否定义了名为 `main` 的顶层函数。

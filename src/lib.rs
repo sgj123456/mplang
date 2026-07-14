@@ -4,6 +4,7 @@ pub mod error;
 pub mod hir;
 pub mod lexer;
 pub mod lowering;
+pub mod monomorphize;
 pub mod parser;
 pub mod symbol;
 pub mod token;
