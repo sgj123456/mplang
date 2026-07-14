@@ -318,7 +318,7 @@ impl Mono {
             def_id: new_id,
             visibility: crate::hir::Visibility::Public,
             attributes: Vec::new(),
-            name: self.fn_name_hint(tmpl),
+            name: self.fn_name_hint(tmpl, targs, cargs),
             generics: Vec::new(),
             params,
             return_ty,
@@ -328,9 +328,17 @@ impl Mono {
         new_id
     }
 
-    fn fn_name_hint(&self, tmpl: DefId) -> String {
+    fn fn_name_hint(&self, tmpl: DefId, targs: &[HirType], cargs: &[i64]) -> String {
         // 仅用于链接名可读；实际链接名由 codegen 按 DefId 决定，名字可重复。
-        format!("__mono_{}", tmpl.0)
+        // 包含类型实参哈希以确保不同实例有不同名字。
+        let mut s = format!("__mono_{}", tmpl.0);
+        for t in targs {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            t.hash(&mut h);
+            s.push_str(&format!("_{}", h.finish()));
+        }
+        s
     }
 
     /// 实例化（或取已存在的）泛型结构体实例，返回其 [`DefId`]。
@@ -877,6 +885,15 @@ impl Mono {
             HirType::Pointer(e1) => {
                 if let HirType::Pointer(e2) = actual {
                     self.unify(e1, e2, generics, targs);
+                }
+            }
+            HirType::Enum(d1, t1, _) => {
+                if let HirType::Enum(d2, t2, _) = actual
+                    && d1 == d2
+                {
+                    for (x, y) in t1.iter().zip(t2.iter()) {
+                        self.unify(x, y, generics, targs);
+                    }
                 }
             }
             _ => {}

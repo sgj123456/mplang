@@ -988,10 +988,10 @@ impl TypeChecker {
                     if t.is_some() {
                         continue;
                     }
-                    if let Some(HirType::Enum(_, expected_targs, _)) = &self.variant_expected_type {
-                        if let Some(et) = expected_targs.get(i) {
-                            *t = Some(et.clone());
-                        }
+                    if let Some(HirType::Enum(_, expected_targs, _)) = &self.variant_expected_type
+                        && let Some(et) = expected_targs.get(i)
+                    {
+                        *t = Some(et.clone());
                     }
                 }
                 // 将推断结果转为具体实参列表
@@ -1355,6 +1355,15 @@ impl TypeChecker {
                     nl,
                 )
             }
+            HirType::Enum(d, ta, ca) => HirType::Enum(
+                *d,
+                ta.iter()
+                    .map(|t| Self::subst_type(t, generics, type_args, const_args))
+                    .collect(),
+                ca.iter()
+                    .map(|a| Self::resolve_const(a, generics, const_args))
+                    .collect(),
+            ),
             other => other.clone(),
         }
     }
@@ -1425,6 +1434,15 @@ impl TypeChecker {
             }
             HirType::Generic(d1, t1, _) => {
                 if let HirType::Generic(d2, t2, _) = actual
+                    && d1 == d2
+                {
+                    for (x, y) in t1.iter().zip(t2.iter()) {
+                        self.unify_ty(x, y, generics, targs);
+                    }
+                }
+            }
+            HirType::Enum(d1, t1, _) => {
+                if let HirType::Enum(d2, t2, _) = actual
                     && d1 == d2
                 {
                     for (x, y) in t1.iter().zip(t2.iter()) {
