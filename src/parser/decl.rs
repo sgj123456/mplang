@@ -168,7 +168,7 @@ impl Parser {
 
     fn fn_decl(&mut self, attributes: Vec<Meta>) -> TopLevelDecl {
         self.consume(TokenKind::Fn, "Expected 'fn'");
-        let f = self.parse_fn_parts();
+        let f = self.parse_fn_parts(false);
         TopLevelDecl::FnDef {
             attributes,
             name: f.name,
@@ -181,7 +181,8 @@ impl Parser {
 
     /// 解析一个（普通或 `impl` 内的）函数声明，返回其结构。
     /// `fn` 关键字必须由调用方先 consume，这里从函数名开始解析。
-    fn parse_fn_parts(&mut self) -> ImplMethod {
+    /// `is_static` 仅在 impl/trait 方法中有意义（普通函数始终为 false）。
+    fn parse_fn_parts(&mut self, is_static: bool) -> ImplMethod {
         let name = self
             .consume(TokenKind::Ident, "Expected function name")
             .lexeme
@@ -213,6 +214,7 @@ impl Parser {
             params,
             return_ty,
             body,
+            is_static,
         }
     }
 
@@ -274,8 +276,14 @@ impl Parser {
         self.consume(TokenKind::LeftBrace, "Expected '{' after impl type");
         let mut methods = Vec::new();
         while !self.is_at_end() && !self.check(&TokenKind::RightBrace) {
+            let is_static = if self.check(&TokenKind::Static) {
+                self.advance();
+                true
+            } else {
+                false
+            };
             self.consume(TokenKind::Fn, "Expected 'fn' inside impl block");
-            let f = self.parse_fn_parts();
+            let f = self.parse_fn_parts(is_static);
             methods.push(f);
             // 方法之间可选的分号：`fn foo() {};` 或 `fn foo() {}`。
             if self.check(&TokenKind::Semicolon) {
@@ -307,6 +315,12 @@ impl Parser {
         self.consume(TokenKind::LeftBrace, "Expected '{' after trait name");
         let mut methods = Vec::new();
         while !self.is_at_end() && !self.check(&TokenKind::RightBrace) {
+            let is_static = if self.check(&TokenKind::Static) {
+                self.advance();
+                true
+            } else {
+                false
+            };
             self.consume(TokenKind::Fn, "Expected 'fn' inside trait block");
             let mname = self
                 .consume(TokenKind::Ident, "Expected trait method name")
@@ -349,6 +363,7 @@ impl Parser {
                 params,
                 return_ty,
                 default_body,
+                is_static,
             });
             // 方法之间可选的分号。
             if self.check(&TokenKind::Semicolon) {

@@ -329,6 +329,15 @@ pub enum Expr {
         scrutinee: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+
+    /// 静态方法调用 `Type::method(args)` 或 `path::to::Type::method(args)`。
+    /// `ty_path` 是类型路径，`method` 是方法名。
+    StaticCall {
+        ty_path: Path,
+        method: String,
+        args: Vec<Expr>,
+        turbofish: Vec<TypeOrConst>,
+    },
 }
 
 /// `match` 的一个分支：`pattern => { body }`。
@@ -365,7 +374,7 @@ pub struct Param {
 }
 
 /// `impl` 块内的方法声明。结构与 [`TopLevelDecl::FnDef`] 相同，
-/// 区别是它属于某个 `impl` 快，并隐式带有一个 `self` 接收者参数。
+/// 区别是它属于某个 `impl` 快，并隐式带有一个 `self` 接收者参数（非 static 方法）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImplMethod {
     pub name: String,
@@ -373,11 +382,14 @@ pub struct ImplMethod {
     pub params: Vec<Param>,
     pub return_ty: Type,
     pub body: Vec<Stmt>,
+    /// `true` 表示静态方法（无 `self` 接收者）。
+    pub is_static: bool,
 }
 
 /// `trait` 声明里的一个方法。
 /// - `default_body` 为 `None` 表示「必须由实现方提供」（以 `fn m();` 结尾）；
 /// - 为 `Some(body)` 表示「默认实现」（以 `fn m() {}` 给出，可被重写）。
+/// - `is_static` 为 `true` 表示静态方法（无 `self` 接收者）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraitMethod {
     pub name: String,
@@ -385,6 +397,7 @@ pub struct TraitMethod {
     pub params: Vec<Param>,
     pub return_ty: Type,
     pub default_body: Option<Vec<Stmt>>,
+    pub is_static: bool,
 }
 
 /// 枚举的一个变体：`None` / `Some(T)` / `Point(x:int, y:int)`。

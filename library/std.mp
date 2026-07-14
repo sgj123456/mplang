@@ -112,10 +112,6 @@ use core::print_str;
 use core::swap;
 use core::identity;
 
-// 重新导出 alloc 的构造器（自由函数）与类型。
+// 重新导出 alloc 的构造器（静态方法）与类型。
 use alloc::Vec;
 use alloc::String;
-use alloc::vec_new;
-use alloc::string_new;
-use alloc::string_from_int;
-use alloc::string_from_str;

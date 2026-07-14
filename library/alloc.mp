@@ -53,16 +53,18 @@ struct Vec<T> {
     len: int,
 }
 
-// 构造器（自由函数，因编译器不支持 `Type::method()` 语法）。
-fn vec_new<T>(zero: T) -> Vec<T> {
-    let v: Vec<T> = Vec::<T> {
-        buf: [zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero],
-        len: 0,
-    };
-    return v;
-}
-
 impl<T> Vec<T> {
+    // 以 `zero` 作为初始元素构造一个空向量（len = 0）。
+    // 注意：数组字面量需由与 T 同类型的值填充，故传入 `zero: T` 而非整型 0，
+    // 以在跨文件泛型实例化时正确推导元素类型。
+    static fn new(zero: T) -> Vec<T> {
+        let v: Vec<T> = Vec::<T> {
+            buf: [zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero],
+            len: 0,
+        };
+        return v;
+    }
+
     // 若未满（len < 64），将 x 追加到末尾。返回更新后的向量。
     fn push(x: T) -> Vec<T> {
         if (self.len < 64) {
@@ -108,29 +110,31 @@ struct String {
     cap: int,
 }
 
-// 构造器（自由函数）。
-fn string_new() -> String {
-    let b: *char = malloc_char(64);
-    libc_strcpy(b, "");
-    let s: String = String { buf: b, len: 0, cap: 64 };
-    return s;
-}
-
-fn string_from_int(x: int) -> String {
-    let b: *char = malloc_char(64);
-    libc_sprintf(b, "%d", x);
-    let s: String = String { buf: b, len: libc_strlen(b), cap: 64 };
-    return s;
-}
-
-fn string_from_str(src: *char) -> String {
-    let b: *char = malloc_char(64);
-    libc_strcpy(b, src);
-    let s: String = String { buf: b, len: libc_strlen(b), cap: 64 };
-    return s;
-}
-
 impl String {
+    // 构造一个空字符串（初始容量 64 字节）。
+    static fn new() -> String {
+        let b: *char = malloc_char(64);
+        libc_strcpy(b, "");
+        let s: String = String { buf: b, len: 0, cap: 64 };
+        return s;
+    }
+
+    // 从整数构造字符串（使用 libc sprintf）。
+    static fn from_int(x: int) -> String {
+        let b: *char = malloc_char(64);
+        libc_sprintf(b, "%d", x);
+        let s: String = String { buf: b, len: libc_strlen(b), cap: 64 };
+        return s;
+    }
+
+    // 从 C 字符串构造（深拷贝）。
+    static fn from_str(src: *char) -> String {
+        let b: *char = malloc_char(64);
+        libc_strcpy(b, src);
+        let s: String = String { buf: b, len: libc_strlen(b), cap: 64 };
+        return s;
+    }
+
     fn len() -> int {
         return self.len;
     }

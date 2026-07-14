@@ -4,8 +4,6 @@ use std::println_int;
 use std::println_str;
 use std::print_int;
 use std::print_str;
-use std::vec_new;
-use std::string_from_int;
 
 #[link_name = "malloc"] extern fn malloc_char(size: int) -> *char;
 
@@ -60,14 +58,14 @@ fn main() -> int {
     if (rval != 100) { return 8; }
 
     // 使用 Vec 和 String（成员方法语法）
-    let v0: Vec<int> = vec_new(0);
+    let v0: Vec<int> = Vec::new(0);
     let v1: Vec<int> = v0.push(10);
     let v2: Vec<int> = v1.push(20);
     if (v2.len() != 2) { return 9; }
     if (v2.get(0) != 10) { return 10; }
     if (v2.get(1) != 20) { return 11; }
 
-    let s1: String = string_from_int(256);
+    let s1: String = String::from_int(256);
     let s2: String = s1.cat(s1);
     if (s2.len() != 6) { return 12; }
 

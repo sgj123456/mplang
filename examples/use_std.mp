@@ -5,8 +5,6 @@ use std::println_str;
 use std::print_int;
 use std::print_str;
 use std::swap;
-use std::vec_new;
-use std::string_from_int;
 
 #[link_name = "malloc"] extern fn malloc_char(size: int) -> *char;
 
@@ -23,13 +21,13 @@ fn main() -> int {
     if ((2).pow(10) != 1024) { return 4; }
 
     // 容器（Vec 通过成员方法调用）
-    let v0: Vec<int> = vec_new(0);
+    let v0: Vec<int> = Vec::new(0);
     let v1: Vec<int> = v0.push(100);
     if (v1.len() != 1) { return 5; }
     if (v1.get(0) != 100) { return 6; }
 
     // 字符串（String 通过成员方法调用）
-    let s1: String = string_from_int(7);
+    let s1: String = String::from_int(7);
     let s2: String = s1.cat(s1);
     if (s2.len() != 2) { return 7; }
 

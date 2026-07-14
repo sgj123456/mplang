@@ -85,6 +85,7 @@ struct TraitMethodInfo {
     return_ty: ast::Type,
     /// `None` = 必须由实现方提供；`Some(body)` = 默认实现（可被重写）。
     default_body: Option<Vec<ast::Stmt>>,
+    is_static: bool,
 }
 
 impl Lowerer {
@@ -212,6 +213,7 @@ impl Lowerer {
                             params: m.params.clone(),
                             return_ty: m.return_ty.clone(),
                             default_body: m.default_body.clone(),
+                            is_static: m.is_static,
                         })
                         .collect();
                     self.traits.insert(name.clone(), infos);
@@ -372,6 +374,15 @@ impl Lowerer {
                                         ty, tr_name, m.name
                                     )))
                                 });
+                            // static 标志必须匹配。
+                            if m.is_static != sig.is_static {
+                                let kind_desc = if m.is_static { "静态" } else { "非静态" };
+                                let sig_desc = if sig.is_static { "静态" } else { "非静态" };
+                                fatal(MplangError::lowering(format!(
+                                    "方法 `{}` 是{}方法，但 trait `{}` 中声明为{}方法",
+                                    m.name, kind_desc, tr_name, sig_desc
+                                )));
+                            }
                             // 签名比对：显式参数（不含隐式 `self`）个数与类型，以及返回类型。
                             if m.params.len() != sig.params.len() {
                                 fatal(MplangError::lowering(format!(
@@ -418,6 +429,7 @@ impl Lowerer {
                                     params: t.params.clone(),
                                     return_ty: t.return_ty.clone(),
                                     body: t.default_body.clone().unwrap(),
+                                    is_static: t.is_static,
                                 });
                             }
                         }
@@ -468,16 +480,20 @@ impl Lowerer {
                             generics.iter().chain(m.generics.iter()).cloned().collect();
                         let saved = std::mem::replace(&mut self.cur_generics, combined.clone());
 
-                        let self_id = self.alloc();
+                        let mut params_hir: Vec<hir::HirParam> = Vec::new();
                         let mut locals: HashMap<String, DefId> = HashMap::new();
-                        locals.insert("self".to_string(), self_id);
 
-                        let mut params_hir = vec![hir::HirParam {
-                            def_id: self_id,
-                            name: "self".to_string(),
-                            ty: recv_ty.clone(),
-                            kind: ParamKind::Value,
-                        }];
+                        // 非静态方法：注入隐式 self 作为第一个参数。
+                        if !m.is_static {
+                            let self_id = self.alloc();
+                            locals.insert("self".to_string(), self_id);
+                            params_hir.push(hir::HirParam {
+                                def_id: self_id,
+                                name: "self".to_string(),
+                                ty: recv_ty.clone(),
+                                kind: ParamKind::Value,
+                            });
+                        }
                         for (i, gp) in combined.iter().enumerate() {
                             if gp.kind == crate::ast::GenericParamKind::Const {
                                 let cid = self.alloc();
@@ -515,8 +531,35 @@ impl Lowerer {
                             params: params_hir,
                             return_ty: return_ty_hir,
                             body: body_hir,
-                            impl_receiver: Some(recv_ty.clone()),
+                            impl_receiver: if m.is_static {
+                                None
+                            } else {
+                                Some(recv_ty.clone())
+                            },
                         });
+
+                        // 静态方法：同时注册为 `Type::method` 路径，使其可通过
+                        // `Vec::new()` 或 `TypeName::method()` 语法调用。
+                        if m.is_static {
+                            // 从 AST ty 中提取类型名（如 "Vec"、"String"）。
+                            let type_name = match ty {
+                                crate::ast::Type::Named(p) | crate::ast::Type::Applied(p, _) => {
+                                    p.last().unwrap_or("").to_string()
+                                }
+                                _ => String::new(),
+                            };
+                            if !type_name.is_empty() {
+                                let mut static_segs = prefix.to_vec();
+                                static_segs.push(type_name.clone());
+                                static_segs.push(m.name.clone());
+                                self.path_to_def.insert(self.sym(&static_segs), *mid);
+                                // 也注册到无前缀路径（如 ["Vec", "new"]），使用户无需写
+                                // `alloc::Vec::new()` 即可调用。
+                                let mut bare_segs = vec![type_name.clone(), m.name.clone()];
+                                self.path_to_def.insert(self.sym(&bare_segs), *mid);
+                                self.last_seg_index.insert(m.name.clone(), *mid);
+                            }
+                        }
                     }
                 }
                 TopLevelDecl::StructDef {
@@ -882,6 +925,26 @@ impl Lowerer {
                 array: Box::new(self.lower_expr(array, locals)),
                 index: Box::new(self.lower_expr(index, locals)),
             },
+
+            Expr::StaticCall {
+                ty_path,
+                method,
+                args,
+                turbofish,
+            } => {
+                // 把 `Type::method(args)` 构造为 `Call { callee: Path([..., "Type", "method"]), args }`。
+                // 路径前缀来自 ty_path 的各段 + method 名。
+                let mut callee_segs = ty_path.segments.clone();
+                callee_segs.push(method.clone());
+                let callee_path = crate::ast::Path::new(callee_segs);
+                let def = self.resolve_path(&callee_path, "静态方法调用");
+                let args_hir = args.iter().map(|a| self.lower_expr(a, locals)).collect();
+                hir::HirExpr::Call {
+                    callee: def,
+                    args: args_hir,
+                    turbofish: self.lower_turbofish(turbofish),
+                }
+            }
 
             Expr::Match { scrutinee, arms } => {
                 let scrutinee_hir = self.lower_expr(scrutinee, locals);
