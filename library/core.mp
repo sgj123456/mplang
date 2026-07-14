@@ -11,18 +11,22 @@ enum Option<T> { None, Some(value: T) }
 
 enum Result<T, E> { Ok(value: T), Err(error: E) }
 
-fn option_is_some<T>(o: Option<T>) -> int {
-    return match(o) {
-        None => { 0; },
-        Some(v) => { 1; },
-    };
+impl<T> Option<T> {
+    fn is_some() -> int {
+        return match(self) {
+            None => { 0; },
+            Some(v) => { 1; },
+        };
+    }
 }
 
-fn result_is_ok<T, E>(r: Result<T, E>) -> int {
-    return match(r) {
-        Ok(v) => { 1; },
-        Err(e) => { 0; },
-    };
+impl<T, E> Result<T, E> {
+    fn is_ok() -> int {
+        return match(self) {
+            Ok(v) => { 1; },
+            Err(e) => { 0; },
+        };
+    }
 }
 
 // ───────────────── 打印辅助（供 alloc / std 复用） ─────────────────
@@ -38,50 +42,52 @@ fn print_str(s: *char) -> int {
     return puts(s);
 }
 
-// ───────────────── 数值工具 ─────────────────
+// ───────────────── 数值工具（以 impl int 方法提供） ─────────────────
 
-fn min(a: int, b: int) -> int {
-    if (a < b) { return a; }
-    return b;
-}
-
-fn max(a: int, b: int) -> int {
-    if (a > b) { return a; }
-    return b;
-}
-
-fn abs(x: int) -> int {
-    if (x < 0) { return 0 - x; }
-    return x;
-}
-
-// 把 `x` 钳制到 [lo, hi] 区间。
-fn clamp(x: int, lo: int, hi: int) -> int {
-    if (x < lo) { return lo; }
-    if (x > hi) { return hi; }
-    return x;
-}
-
-fn cmp(a: int, b: int) -> int {
-    if (a < b) { return 0 - 1; }
-    if (a > b) { return 1; }
-    return 0;
-}
-
-fn is_equal(a: int, b: int) -> int {
-    if (a == b) { return 1; }
-    return 0;
-}
-
-// 整型幂：pow(base, exp) = base^exp（exp >= 0）。
-fn pow(base: int, exp: int) -> int {
-    let r: int = 1;
-    let i: int = 0;
-    while (i < exp) {
-        r = r * base;
-        i = i + 1;
+impl int {
+    fn min(b: int) -> int {
+        if (self < b) { return self; }
+        return b;
     }
-    return r;
+
+    fn max(b: int) -> int {
+        if (self > b) { return self; }
+        return b;
+    }
+
+    fn abs() -> int {
+        if (self < 0) { return 0 - self; }
+        return self;
+    }
+
+    // 把 self 钳制到 [lo, hi] 区间。
+    fn clamp(lo: int, hi: int) -> int {
+        if (self < lo) { return lo; }
+        if (self > hi) { return hi; }
+        return self;
+    }
+
+    fn cmp(b: int) -> int {
+        if (self < b) { return 0 - 1; }
+        if (self > b) { return 1; }
+        return 0;
+    }
+
+    fn is_equal(b: int) -> int {
+        if (self == b) { return 1; }
+        return 0;
+    }
+
+    // 整型幂：self.pow(exp) = self^exp（exp >= 0）。
+    fn pow(exp: int) -> int {
+        let r: int = 1;
+        let i: int = 0;
+        while (i < exp) {
+            r = r * self;
+            i = i + 1;
+        }
+        return r;
+    }
 }
 
 // ───────────────── 泛型算法 ─────────────────

@@ -203,7 +203,14 @@ impl TypeChecker {
                 );
                 // `impl` 方法：登记 (接收者类型, 方法名) → 定义 ID，供 `.` 调用解析。
                 if let Some(recv) = impl_receiver {
-                    let key = MethodKey(recv.clone(), name.clone());
+                    // 对于泛型 impl（如 `impl<T> Vec<T>`），接收者类型可能是 `Generic(def, [Var(..)])`。
+                    // 对于 enum 的 impl（如 `impl<T> Option<T>`），接收者类型是 `Enum(def, [Var(..)])`。
+                    // 统一用 `Named(def)` 作为键。
+                    let key_ty = match &recv {
+                        HirType::Generic(d, _, _) | HirType::Enum(d, _, _) => HirType::Named(*d),
+                        _ => recv.clone(),
+                    };
+                    let key = MethodKey(key_ty, name.clone());
                     if self.method_table.contains_key(&key) {
                         fatal(MplangError::lowering(format!(
                             "类型 {:?} 重复为方法 `{}` 提供实现（一个类型上同一方法只能实现一次）",
@@ -615,9 +622,13 @@ impl TypeChecker {
                     };
                 }
 
+                let lookup_ty = match &obj.ty {
+                    HirType::Generic(d, _, _) | HirType::Enum(d, _, _) => HirType::Named(*d),
+                    _ => obj.ty.clone(),
+                };
                 let callee = self
                     .method_table
-                    .get(&MethodKey(obj.ty.clone(), name.clone()))
+                    .get(&MethodKey(lookup_ty, name.clone()))
                     .cloned()
                     .unwrap_or_else(|| {
                         fatal(MplangError::type_error(format!(
@@ -641,13 +652,41 @@ impl TypeChecker {
                         args.len()
                     )));
                 }
-                self.assert_ty(
-                    &obj.ty,
-                    &sig.param_types[0],
-                    &format!("方法 `{}` 的接收者类型", name),
-                );
+                // 对接收者类型做结构级比较（支持 Generic/Enum(def, targs) vs Generic/Enum(def, [Var(..)]) 匹配）
+                match (&obj.ty, &sig.param_types[0]) {
+                    (HirType::Generic(d1, _, _), HirType::Generic(d2, _, _)) if d1 == d2 => {}
+                    (HirType::Enum(d1, _, _), HirType::Enum(d2, _, _)) if d1 == d2 => {}
+                    (HirType::Named(d1), HirType::Named(d2)) if d1 == d2 => {}
+                    _ => self.assert_ty(
+                        &obj.ty,
+                        &sig.param_types[0],
+                        &format!("方法 `{}` 的接收者类型", name),
+                    ),
+                }
 
                 // 接收者作为首个实参，紧随其后为用户实参。
+                // 若方法来自泛型 impl，需要把 self 的泛型实参代入 param_types 和 ret_ty。
+                let (subst_params, subst_ret_ty) =
+                    if let HirType::Generic(_def_id, targs, cargs) = &obj.ty {
+                        let subst_params: Vec<HirType> = sig
+                            .param_types
+                            .iter()
+                            .map(|pt| Self::subst_type(pt, &sig.generics, targs, cargs))
+                            .collect();
+                        let subst_ret = Self::subst_type(&sig.ret_ty, &sig.generics, targs, cargs);
+                        (subst_params, subst_ret)
+                    } else if let HirType::Enum(_def_id, targs, cargs) = &obj.ty {
+                        let subst_params: Vec<HirType> = sig
+                            .param_types
+                            .iter()
+                            .map(|pt| Self::subst_type(pt, &sig.generics, targs, cargs))
+                            .collect();
+                        let subst_ret = Self::subst_type(&sig.ret_ty, &sig.generics, targs, cargs);
+                        (subst_params, subst_ret)
+                    } else {
+                        (sig.param_types.clone(), sig.ret_ty.clone())
+                    };
+
                 let mut typed_args: Vec<crate::tyhir::TyHirExpr> =
                     Vec::with_capacity(args.len() + 1);
                 typed_args.push(obj);
@@ -655,14 +694,14 @@ impl TypeChecker {
                     let te = self.check_expr(arg);
                     self.assert_ty(
                         &te.ty,
-                        &sig.param_types[i + 1],
+                        &subst_params[i + 1],
                         &format!("方法 `{}` 第 {} 个参数", name, i),
                     );
                     typed_args.push(te);
                 }
 
                 crate::tyhir::TyHirExpr {
-                    ty: sig.ret_ty.clone(),
+                    ty: subst_ret_ty,
                     kind: crate::tyhir::TyHirExprKind::Call {
                         callee,
                         args: typed_args,

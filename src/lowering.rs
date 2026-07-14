@@ -502,6 +502,8 @@ impl Lowerer {
                         }
 
                         let body_hir = self.lower_body(&m.body, &mut locals);
+
+                        let return_ty_hir = self.lower_type(&m.return_ty);
                         self.cur_generics = saved;
 
                         items.push(hir::HirItem::Fn {
@@ -511,7 +513,7 @@ impl Lowerer {
                             name: m.name.clone(),
                             generics: combined,
                             params: params_hir,
-                            return_ty: self.lower_type(&m.return_ty),
+                            return_ty: return_ty_hir,
                             body: body_hir,
                             impl_receiver: Some(recv_ty.clone()),
                         });

@@ -3,7 +3,7 @@
 //   * 带换行的打印：`println_int` / `println_str`（其余打印见下方对 core 的重新导出）；
 //   * 失败处理：`unreachable` / `abort`；
 //   * 基于 libc `FILE*` 的文件 I/O：`file_open` / `file_write_line` / `file_read_line`
-//     / `file_close`，以及返回 `Option` 的 `file_read_line_opt`；
+//     / `file_close`；
 //   * 演示用 `Allocator` trait 与 trait 对象。
 //
 // 路径说明：这里不写 `#[path]`。编译器在解析 `extern crate` 时会从顶层输入目录
@@ -69,23 +69,9 @@ fn file_write_line(f: *char, s: *char) -> int {
 
 // 从文件读取一行到调用方提供的缓冲 `buf`（容量 `max`，含结尾 '\0'）。
 // 成功返回读取的字符数（不含结尾 '\0'）；到达文件尾且无内容时返回 0。
-// 注意：返回的字符串以 '\0' 结尾，但可能包含行尾的 '\n'（由 libc `fgets` 决定）。
-// 说明：MPLang 没有 NULL 字面量（整型 0 与指针不可比较），故不显式判空，
-// 而是直接依赖 `libc_fgets` 的返回值——句柄无效时 `strlen(buf)` 亦为 0。
 fn file_read_line(f: *char, buf: *char, max: int) -> int {
     libc_fgets(buf, max, f);
     return strlen(buf);
-}
-
-// 返回 `Option` 的读取。成功时 `Some(buf)`；无内容或错误时 `None`。
-fn file_read_line_opt(f: *char, buf: *char, max: int) -> Option<*char> {
-    libc_fgets(buf, max, f);
-    let n: int = strlen(buf);
-    if (n == 0) {
-        let r: Option<*char> = None;
-        return r;
-    }
-    return Some(buf);
 }
 
 // ───────────────── 演示：Allocator trait 与 trait 对象 ─────────────────
@@ -110,7 +96,6 @@ impl Allocator for SysAllocator {
 }
 
 // 通过 trait 对象调用分配器（演示动态分发）。
-// 注意：v1 简化下动态方法调用的返回类型固定为 Int，故返回 int 而非 *char。
 fn alloc_with(a: *Allocator, size: int) -> int {
     return a.alloc(size);
 }
@@ -124,25 +109,13 @@ use core::printf;
 use core::puts;
 use core::print_int;
 use core::print_str;
-use core::min;
-use core::max;
-use core::abs;
-use core::clamp;
-use core::pow;
 use core::swap;
 use core::identity;
 
+// 重新导出 alloc 的构造器（自由函数）与类型。
 use alloc::Vec;
 use alloc::String;
 use alloc::vec_new;
-use alloc::vec_push;
-use alloc::vec_get;
-use alloc::vec_set;
-use alloc::vec_len;
-use alloc::vec_pop;
 use alloc::string_new;
 use alloc::string_from_int;
 use alloc::string_from_str;
-use alloc::string_cat;
-use alloc::string_len;
-use alloc::string_as_ptr;

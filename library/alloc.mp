@@ -25,23 +25,25 @@
 //
 // 由于没有提供泛型 FFI，这里为常用具象类型提供构造 / 读写函数。
 
+impl *int {
+    fn get() -> int {
+        return *self;
+    }
+
+    fn set(x: int) -> int {
+        *self = x;
+        return x;
+    }
+
+    fn free() -> int {
+        return free_int(self);
+    }
+}
+
 fn box_new_int(x: int) -> *int {
     let p: *int = malloc_int(8);
     *p = x;
     return p;
-}
-
-fn box_get_int(p: *int) -> int {
-    return *p;
-}
-
-fn box_set_int(p: *int, x: int) -> int {
-    *p = x;
-    return x;
-}
-
-fn box_free_int(p: *int) -> int {
-    return free_int(p);
 }
 
 // ───────────────── Vec<T>：定容 64 的向量 ─────────────────
@@ -51,9 +53,7 @@ struct Vec<T> {
     len: int,
 }
 
-// 以 `zero` 作为初始元素构造一个空向量（len = 0）。
-// 注意：数组字面量需由与 T 同类型的值填充，故传入 `zero: T` 而非整型 0，
-// 以在跨文件泛型实例化时正确推导元素类型。
+// 构造器（自由函数，因编译器不支持 `Type::method()` 语法）。
 fn vec_new<T>(zero: T) -> Vec<T> {
     let v: Vec<T> = Vec::<T> {
         buf: [zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero],
@@ -62,35 +62,37 @@ fn vec_new<T>(zero: T) -> Vec<T> {
     return v;
 }
 
-// 若未满（len < 64），将 x 追加到末尾。返回更新后的向量。
-fn vec_push<T>(v: Vec<T>, x: T) -> Vec<T> {
-    if (v.len < 64) {
-        v.buf[v.len] = x;
-        v.len = v.len + 1;
+impl<T> Vec<T> {
+    // 若未满（len < 64），将 x 追加到末尾。返回更新后的向量。
+    fn push(x: T) -> Vec<T> {
+        if (self.len < 64) {
+            self.buf[self.len] = x;
+            self.len = self.len + 1;
+        }
+        return self;
     }
-    return v;
-}
 
-fn vec_get<T>(v: Vec<T>, i: int) -> T {
-    return v.buf[i];
-}
-
-// 将下标 i 处元素设为 x，返回更新后的向量。
-fn vec_set<T>(v: Vec<T>, i: int, x: T) -> Vec<T> {
-    v.buf[i] = x;
-    return v;
-}
-
-fn vec_len<T>(v: Vec<T>) -> int {
-    return v.len;
-}
-
-// 若非空，弹出末尾元素（仅减小长度；返回更新后的向量）。
-fn vec_pop<T>(v: Vec<T>) -> Vec<T> {
-    if (v.len > 0) {
-        v.len = v.len - 1;
+    fn get(i: int) -> T {
+        return self.buf[i];
     }
-    return v;
+
+    // 将下标 i 处元素设为 x，返回更新后的向量。
+    fn set(i: int, x: T) -> Vec<T> {
+        self.buf[i] = x;
+        return self;
+    }
+
+    fn len() -> int {
+        return self.len;
+    }
+
+    // 若非空，弹出末尾元素（仅减小长度；返回更新后的向量）。
+    fn pop() -> Vec<T> {
+        if (self.len > 0) {
+            self.len = self.len - 1;
+        }
+        return self;
+    }
 }
 
 // ───────────────── String：基于 *char 缓冲 + libc ─────────────────
@@ -106,7 +108,7 @@ struct String {
     cap: int,
 }
 
-// 构造一个空字符串（初始容量 64 字节）。
+// 构造器（自由函数）。
 fn string_new() -> String {
     let b: *char = malloc_char(64);
     libc_strcpy(b, "");
@@ -114,7 +116,6 @@ fn string_new() -> String {
     return s;
 }
 
-// 从整数构造字符串（使用 libc sprintf）。
 fn string_from_int(x: int) -> String {
     let b: *char = malloc_char(64);
     libc_sprintf(b, "%d", x);
@@ -122,7 +123,6 @@ fn string_from_int(x: int) -> String {
     return s;
 }
 
-// 从 C 字符串构造（深拷贝）。
 fn string_from_str(src: *char) -> String {
     let b: *char = malloc_char(64);
     libc_strcpy(b, src);
@@ -130,29 +130,31 @@ fn string_from_str(src: *char) -> String {
     return s;
 }
 
-fn string_len(s: String) -> int {
-    return s.len;
-}
+impl String {
+    fn len() -> int {
+        return self.len;
+    }
 
-// 在末尾追加一个字符（用 libc 写入，避免 MPLang 侧指针下标）。
-fn string_push(s: String, c: char) -> String {
-    let tmp: *char = malloc_char(8);
-    libc_sprintf(tmp, "%c", c);
-    libc_strcat(s.buf, tmp);
-    let n: String = String { buf: s.buf, len: libc_strlen(s.buf), cap: s.cap };
-    return n;
-}
+    // 在末尾追加一个字符（用 libc 写入，避免 MPLang 侧指针下标）。
+    fn push(c: char) -> String {
+        let tmp: *char = malloc_char(8);
+        libc_sprintf(tmp, "%c", c);
+        libc_strcat(self.buf, tmp);
+        let n: String = String { buf: self.buf, len: libc_strlen(self.buf), cap: self.cap };
+        return n;
+    }
 
-// 拼接两个字符串（深拷贝到新缓冲）。
-fn string_cat(a: String, b: String) -> String {
-    let out: *char = malloc_char(128);
-    libc_strcpy(out, a.buf);
-    libc_strcat(out, b.buf);
-    let s: String = String { buf: out, len: libc_strlen(out), cap: 128 };
-    return s;
-}
+    // 拼接两个字符串（深拷贝到新缓冲）。
+    fn cat(b: String) -> String {
+        let out: *char = malloc_char(128);
+        libc_strcpy(out, self.buf);
+        libc_strcat(out, b.buf);
+        let s: String = String { buf: out, len: libc_strlen(out), cap: 128 };
+        return s;
+    }
 
-// 取得底层 C 字符串指针（用于打印等）。
-fn string_as_ptr(s: String) -> *char {
-    return s.buf;
+    // 取得底层 C 字符串指针（用于打印等）。
+    fn as_ptr() -> *char {
+        return self.buf;
+    }
 }
