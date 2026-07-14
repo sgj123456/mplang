@@ -1015,8 +1015,7 @@ impl TypeChecker {
                     .unwrap_or_default();
                 let mut targs: Vec<Option<HirType>> = generics.iter().map(|_| None).collect();
                 let mut typed_args = Vec::with_capacity(args.len());
-                for (_i, (arg, (_, _, fty))) in args.iter().zip(var_info.fields.iter()).enumerate()
-                {
+                for (arg, (_, _, fty)) in args.iter().zip(var_info.fields.iter()) {
                     let ta = self.check_expr(arg);
                     // 用 unify_ty 来推断 Var 占位符
                     self.unify_ty(fty, &ta.ty, &generics, &mut targs);

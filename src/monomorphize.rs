@@ -328,7 +328,7 @@ impl Mono {
         new_id
     }
 
-    fn fn_name_hint(&self, tmpl: DefId, targs: &[HirType], cargs: &[i64]) -> String {
+    fn fn_name_hint(&self, tmpl: DefId, targs: &[HirType], _cargs: &[i64]) -> String {
         // 仅用于链接名可读；实际链接名由 codegen 按 DefId 决定，名字可重复。
         // 包含类型实参哈希以确保不同实例有不同名字。
         let mut s = format!("__mono_{}", tmpl.0);

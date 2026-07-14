@@ -452,24 +452,24 @@ impl Lowerer {
                         HirType::Named(d) => Some(*d),
                         _ => None,
                     };
-                    if let Some(trait_def) = trait_def_for_vtable {
-                        if let Some(impl_type_def) = impl_type_def {
-                            let tr_name = trrait.as_ref().unwrap().last().unwrap().to_string();
-                            let req = self.traits.get(&tr_name).unwrap();
-                            let vtable_methods: Vec<DefId> = req
-                                .iter()
-                                .map(|tm| {
-                                    lowered_ids.get(&tm.name).cloned().unwrap_or_else(|| {
-                                        fatal(MplangError::lowering(format!(
-                                            "内部错误：方法 `{}` 未在 vtable 中找到",
-                                            tm.name
-                                        )))
-                                    })
+                    if let Some(trait_def) = trait_def_for_vtable
+                        && let Some(impl_type_def) = impl_type_def
+                    {
+                        let tr_name = trrait.as_ref().unwrap().last().unwrap().to_string();
+                        let req = self.traits.get(&tr_name).unwrap();
+                        let vtable_methods: Vec<DefId> = req
+                            .iter()
+                            .map(|tm| {
+                                lowered_ids.get(&tm.name).cloned().unwrap_or_else(|| {
+                                    fatal(MplangError::lowering(format!(
+                                        "内部错误：方法 `{}` 未在 vtable 中找到",
+                                        tm.name
+                                    )))
                                 })
-                                .collect();
-                            self.vtables
-                                .insert((trait_def, impl_type_def), vtable_methods);
-                        }
+                            })
+                            .collect();
+                        self.vtables
+                            .insert((trait_def, impl_type_def), vtable_methods);
                     }
 
                     // 现在用 method_defs 中的预分配 ID 来真正降低每个方法。
@@ -555,7 +555,7 @@ impl Lowerer {
                                 self.path_to_def.insert(self.sym(&static_segs), *mid);
                                 // 也注册到无前缀路径（如 ["Vec", "new"]），使用户无需写
                                 // `alloc::Vec::new()` 即可调用。
-                                let mut bare_segs = vec![type_name.clone(), m.name.clone()];
+                                let bare_segs = vec![type_name.clone(), m.name.clone()];
                                 self.path_to_def.insert(self.sym(&bare_segs), *mid);
                                 self.last_seg_index.insert(m.name.clone(), *mid);
                             }
@@ -1032,10 +1032,10 @@ impl Lowerer {
             Type::Pointer(inner) => {
                 let inner_hir = self.lower_type(inner);
                 // 若 inner 是 `Named(def)` 且 def 是已注册的 trait，则返回 TraitObject
-                if let HirType::Named(def) = &inner_hir {
-                    if self.trait_def_map.values().any(|t| t == def) {
-                        return HirType::TraitObject(*def);
-                    }
+                if let HirType::Named(def) = &inner_hir
+                    && self.trait_def_map.values().any(|t| t == def)
+                {
+                    return HirType::TraitObject(*def);
                 }
                 HirType::Pointer(Box::new(inner_hir))
             }

@@ -34,12 +34,34 @@ impl<T, E> Result<T, E> {
 #[link_name = "printf"] extern fn printf(*char, ...) -> int;
 #[link_name = "puts"]   extern fn puts(*char) -> int;
 
+// 自由函数版（向后兼容）。
 fn print_int(x: int) -> int {
     return printf("%d", x);
 }
 
 fn print_str(s: *char) -> int {
     return puts(s);
+}
+
+// 以 impl 方法提供 `print` / `println`（通过方法分发实现「特化」效果）。
+impl int {
+    fn print() -> int {
+        return printf("%d", self);
+    }
+
+    fn println() -> int {
+        return printf("%d\n", self);
+    }
+}
+
+impl *char {
+    fn print() -> int {
+        return puts(self);
+    }
+
+    fn println() -> int {
+        return printf("%s\n", self);
+    }
 }
 
 // ───────────────── 数值工具（以 impl int 方法提供） ─────────────────
